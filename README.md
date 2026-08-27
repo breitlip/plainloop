@@ -54,8 +54,13 @@ The package ships a pi extension, so in any pi session (TUI, RPC, pi-web):
 /plainloop status [mission]                 # progress (mission auto-detected from ./missions/)
 /plainloop run <mission> [--max N] [--dry-run]
 /plainloop stop [mission]
+/plainloop version                          # installed extension version + install path
 /plainloop help
 ```
+
+`version` is handy for checking what is actually loaded, since pi-web's
+Settings → Pi packages panel only shows the source and install path, not
+the version.
 
 `run` starts the driver as a detached background process — the session stays
 responsive and you get a notification when the run finishes. The driver also
