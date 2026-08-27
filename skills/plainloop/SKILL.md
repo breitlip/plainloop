@@ -171,15 +171,22 @@ and adds a `driver.json` with the machine-checkable parts: `verify` and
 retry policy. The reference implementation ships with this package as
 `driver.mjs` (see the package README).
 
-Running the driver: it is a plain Node script, no dependencies. Locate it
-next to this skill (package installs keep `driver.mjs` at the package root)
-or use the `plainloop` bin if it is on PATH:
+Running the driver: it is a plain Node script, no dependencies. `driver.mjs`
+lives at the package root, next to `skills/`. Typical install locations:
+
+```text
+git install:  ~/.pi/agent/git/github.com/<user>/plainloop/driver.mjs
+npm install:  ~/.pi/agent/npm/node_modules/plainloop/driver.mjs
+```
 
 ```bash
-plainloop run <mission-dir> --max 5 --verbose     # if bin is linked
-# otherwise:
-node <package-root>/driver.mjs run <mission-dir> --max 5 --verbose
+node ~/.pi/agent/git/github.com/<user>/plainloop/driver.mjs run <mission-dir> --max 5 --verbose
+node <driver> status <mission-dir>
 ```
+
+If a `plainloop` bin is on PATH (some installs link it), `plainloop run …`
+works directly. When in doubt: `find ~/.pi/agent -name driver.mjs -path "*plainloop*"`.
+
 
 Reference implementation flow per task:
 
