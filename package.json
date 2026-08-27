@@ -1,0 +1,26 @@
+{
+  "name": "plainloop",
+  "version": "0.1.0",
+  "description": "Endless-loop mission driver for pi: a stateless RPC driver that steers parent, worker, and read-only reviewer pi sessions across a markdown mission contract (MISSION/STATE/TASK/history).",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "loop",
+    "missions",
+    "autonomous",
+    "rpc"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "plainloop": "./driver.mjs"
+  },
+  "files": [
+    "driver.mjs",
+    "skills/",
+    "README.md"
+  ],
+  "pi": {
+    "skills": ["./skills"]
+  }
+}
