@@ -95,7 +95,8 @@ Flags:
 ├── CURRENT.md    worker scratch
 ├── history/      completed briefs: TASK-0001.md, TASK-0002.md, ...
 ├── driver.json   driver contract (all keys optional)
-└── driver.log    append-only driver activity log
+├── driver.log    append-only driver activity log
+└── driver.err.log driver stderr (crash diagnostics) when started via the extension
 ```
 
 ### driver.json

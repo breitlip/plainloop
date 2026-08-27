@@ -1,6 +1,6 @@
 {
   "name": "plainloop",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Endless-loop mission driver for pi: a stateless RPC driver that steers parent, worker, and read-only reviewer pi sessions across a markdown mission contract (MISSION/STATE/TASK/history).",
   "keywords": [
     "pi-package",

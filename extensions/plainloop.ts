@@ -17,6 +17,7 @@ import { Type } from "typebox";
 import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -109,10 +110,17 @@ export default function plainloop(pi: ExtensionAPI) {
     if (opts.dryRun) args.push("--dry-run");
     args.push("--verbose");
 
+    // keep the driver's stderr so a crash is diagnosable (was: "ignore")
+    let errFd: number | "ignore" = "ignore";
+    try {
+      errFd = openSync(path.join(mission, "driver.err.log"), "a");
+    } catch {
+      errFd = "ignore";
+    }
     const child = spawn(NODE, args, {
       cwd,
       detached: true,
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", errFd],
     });
     child.unref();
     const pid = child.pid;

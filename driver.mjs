@@ -36,7 +36,11 @@ import {
 } from "node:fs";
 import path from "node:path";
 
-const PI_BIN = process.env.PI_BIN ?? "pi";
+// Windows: `pi` is an extensionless shim; spawn needs `pi.cmd` + shell:true.
+const PI_BIN =
+  process.env.PI_BIN ??
+  (process.platform === "win32" ? "pi.cmd" : "pi");
+const PI_SHELL = process.platform === "win32" || /\.(cmd|bat)$/i.test(PI_BIN);
 
 /** Live RPC sessions, so signals can reap them. */
 const liveSessions = new Set();
@@ -181,7 +185,7 @@ class RpcSession {
     this.proc = spawn(
       PI_BIN,
       args,
-      { cwd, stdio: ["pipe", "pipe", "pipe"] },
+      { cwd, stdio: ["pipe", "pipe", "pipe"], shell: PI_SHELL },
     );
     this.alive = true;
     liveSessions.add(this);
