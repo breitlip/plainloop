@@ -21,6 +21,31 @@ plainloop/driver.mjs (no LLM context)
 All sessions are normal pi sessions — visible in pi-web and in
 `~/.pi/agent/sessions/`.
 
+## Install
+
+The package is a standard pi package (extension + skill), so install it from
+the repo with `pi install`:
+
+```bash
+# from GitHub
+pi install git:github.com/breitlip/plainloop
+pi install https://github.com/breitlip/plainloop   # raw URLs work too
+
+# pin a ref
+pi install git:github.com/breitlip/plainloop@v0.2.0
+
+# or from a local checkout
+pi install /path/to/plainloop
+```
+
+By default this writes to your user settings (`~/.pi/agent/settings.json`).
+Use `-l` to install into project settings (`.pi/settings.json`) instead, or
+`pi -e git:github.com/breitlip/plainloop` to try it for one run without
+installing.
+
+Verify with `pi list`, then restart pi (or start a new session) so the
+`/plainloop` commands and the `plainloop` tool become available.
+
 ## Using from inside pi
 
 The package ships a pi extension, so in any pi session (TUI, RPC, pi-web):
