@@ -50,13 +50,13 @@ export default function plainloop(pi: ExtensionAPI) {
     | { ok: true; mission: string }
     | { ok: false; error: string; list?: string[] };
 
-  function resolveMission(arg?: string): MissionResolution {
+  function resolveMission(arg: string | undefined, cwd: string): MissionResolution {
     if (arg) {
-      const m = path.resolve(arg);
+      const m = path.resolve(cwd, arg);
       if (existsSync(path.join(m, "MISSION.md"))) return { ok: true, mission: m };
       return { ok: false, error: `no MISSION.md in ${m}` };
     }
-    const root = path.join(process.cwd(), "missions");
+    const root = path.join(cwd, "missions");
     if (!existsSync(root))
       return { ok: false, error: "no mission given and no ./missions/ directory here" };
     const list = readdirSync(root, { withFileTypes: true })
@@ -78,6 +78,7 @@ export default function plainloop(pi: ExtensionAPI) {
     mission: string,
     opts: { max?: number; dryRun?: boolean },
     notify: (text: string, kind?: "info" | "error" | "warning") => void,
+    cwd: string,
   ): { ok: boolean; text: string } {
     const existing = livePid(mission);
     if (existing)
@@ -89,7 +90,7 @@ export default function plainloop(pi: ExtensionAPI) {
     args.push("--verbose");
 
     const child = spawn(NODE, args, {
-      cwd: process.cwd(),
+      cwd,
       detached: true,
       stdio: "ignore",
     });
@@ -169,7 +170,7 @@ export default function plainloop(pi: ExtensionAPI) {
         return;
       }
 
-      const res = resolveMission(missionArg);
+      const res = resolveMission(missionArg, ctx.cwd);
       if (!res.ok) {
         notify(res.list ? `${res.error}\n${res.list.join("\n")}` : res.error, "error");
         return;
@@ -181,7 +182,7 @@ export default function plainloop(pi: ExtensionAPI) {
         return;
       }
       if (action === "run") {
-        const r = startRun(mission, { max: flags.max ? Number(flags.max) : undefined, dryRun: Boolean(flags.dryRun) }, notify);
+        const r = startRun(mission, { max: flags.max ? Number(flags.max) : undefined, dryRun: Boolean(flags.dryRun) }, notify, ctx.cwd);
         notify(r.text, r.ok ? "info" : "error");
         return;
       }
@@ -231,7 +232,7 @@ export default function plainloop(pi: ExtensionAPI) {
         }
       };
 
-      const res = resolveMission(params.mission);
+      const res = resolveMission(params.mission, ctx.cwd);
       if (!res.ok) {
         const text = res.list ? `${res.error}\n${res.list.join("\n")}` : res.error;
         notify(text, "error");
@@ -244,7 +245,7 @@ export default function plainloop(pi: ExtensionAPI) {
       if (params.action === "status") {
         text = runStatus(mission);
       } else if (params.action === "run") {
-        const r = startRun(mission, { max: params.max, dryRun: params.dryRun }, notify);
+        const r = startRun(mission, { max: params.max, dryRun: params.dryRun }, notify, ctx.cwd);
         text = r.text;
         ok = r.ok;
       } else {
