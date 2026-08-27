@@ -335,6 +335,32 @@ class RpcSession {
 // status
 // ---------------------------------------------------------------------------
 
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0); // raises if not alive
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function ageStr(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+function tailLines(file, n) {
+  return readFileSync(file, "utf8")
+    .split("\n")
+    .filter((l) => l.trim() !== "")
+    .slice(-n);
+}
+
 function cmdStatus(missionDir, cfg) {
   const done = historyTasks(missionDir);
   const state = existsSync(path.join(missionDir, "STATE.md"))
@@ -348,8 +374,30 @@ function cmdStatus(missionDir, cfg) {
   console.log(`next task:    ${done.length + 1}`);
   if (existsSync(path.join(missionDir, "TASK.md")))
     console.log(`TASK.md:      present (task ${done.length + 1} brief)`);
-  if (existsSync(path.join(missionDir, "driver.log")))
-    console.log(`driver.log:   ${statSync(path.join(missionDir, "driver.log")).size} bytes`);
+
+  // liveness: is a driver actually running for this mission?
+  const pidFile = path.join(missionDir, ".plainloop.pid");
+  if (existsSync(pidFile)) {
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    if (Number.isInteger(pid) && pid > 0 && pidAlive(pid))
+      console.log(`driver:       RUNNING (pid ${pid})`);
+    else
+      console.log(`driver:       pidfile present but pid ${pid} is NOT alive — the run crashed or ended`);
+  } else {
+    console.log(`driver:       not running (no pidfile)`);
+  }
+
+  const logFile = path.join(missionDir, "driver.log");
+  if (existsSync(logFile)) {
+    const st = statSync(logFile);
+    console.log(`driver.log:   ${st.size} bytes, last activity ${ageStr(Date.now() - st.mtimeMs)}`);
+    for (const l of tailLines(logFile, 3)) console.log(`  | ${l}`);
+  }
+  const errFile = path.join(missionDir, "driver.err.log");
+  if (existsSync(errFile) && statSync(errFile).size > 0) {
+    console.log(`driver.err.log: ${statSync(errFile).size} bytes — check it`);
+    for (const l of tailLines(errFile, 3)) console.log(`  ! ${l}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
