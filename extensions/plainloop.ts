@@ -75,6 +75,13 @@ export default function plainloop(pi: ExtensionAPI) {
     return out + (err ? `\n${err}` : "");
   }
 
+  function runList(mission: string): string {
+    const r = spawnSync(NODE, [DRIVER, "list", mission], { encoding: "utf8" });
+    const out = (r.stdout || "").trim();
+    const err = (r.stderr || "").trim();
+    return out + (err ? `\n${err}` : "");
+  }
+
   function versionInfo(): string {
     const pkgDir = path.resolve(here, "..");
     let version = "unknown";
@@ -166,7 +173,7 @@ export default function plainloop(pi: ExtensionAPI) {
 
   pi.registerCommand("plainloop", {
     description:
-      "Drive plainloop missions: /plainloop [status|run|stop|version|help] [mission] [--max N] [--dry-run]",
+      "Drive plainloop missions: /plainloop [status|run|stop|list|version|help] [mission] [--max N] [--dry-run]",
     handler: async (args, ctx) => {
       const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const flags: Record<string, string> = {};
@@ -189,9 +196,10 @@ export default function plainloop(pi: ExtensionAPI) {
       if (action === "help") {
         notify(
           [
-            "/plainloop status [mission] — show status (mission auto-detected from ./missions/)",
+            "/plainloop status [mission] — show status, liveness, and a work summary",
             "/plainloop run <mission> [--max N] [--dry-run] — start a background run",
             "/plainloop stop [mission] — stop a running mission",
+            "/plainloop list [mission] — list the mission's pi sessions (to open in pi-web)",
             "/plainloop version — show the installed extension version",
           ].join("\n"),
           "info",
@@ -215,6 +223,10 @@ export default function plainloop(pi: ExtensionAPI) {
         notify(runStatus(mission), "info");
         return;
       }
+      if (action === "list") {
+        notify(runList(mission), "info");
+        return;
+      }
       if (action === "run") {
         const r = startRun(mission, { max: flags.max ? Number(flags.max) : undefined, dryRun: Boolean(flags.dryRun) }, notify, ctx.cwd);
         notify(r.text, r.ok ? "info" : "error");
@@ -236,13 +248,21 @@ export default function plainloop(pi: ExtensionAPI) {
     label: "Plainloop",
     description:
       "Drive a plainloop mission (a directory with MISSION.md, STATE.md, TASK.md, history/). " +
-      "Actions: 'status' shows progress; 'run' starts a background driver run (optionally capped " +
-      "with max iterations) and returns immediately; 'stop' terminates a running mission; " +
-      "'version' reports the installed extension version. " +
+      "Actions: 'status' shows progress, liveness, and a work summary; 'run' starts a " +
+      "background driver run (optionally capped with max iterations) and returns immediately; " +
+      "'stop' terminates a running mission; 'list' lists the mission's pi sessions (parent, " +
+      "task-NNNN, review-NNNN) so they can be opened in pi-web; 'version' reports the installed " +
+      "extension version. " +
       "Omit mission to auto-detect the single mission under ./missions/.",
     parameters: Type.Object({
       action: Type.Union(
-        [Type.Literal("run"), Type.Literal("status"), Type.Literal("stop"), Type.Literal("version")],
+        [
+          Type.Literal("run"),
+          Type.Literal("status"),
+          Type.Literal("stop"),
+          Type.Literal("list"),
+          Type.Literal("version"),
+        ],
         { description: "What to do with the mission ('version' ignores the other parameters)" },
       ),
       mission: Type.Optional(
@@ -285,6 +305,8 @@ export default function plainloop(pi: ExtensionAPI) {
       let ok = true;
       if (params.action === "status") {
         text = runStatus(mission);
+      } else if (params.action === "list") {
+        text = runList(mission);
       } else if (params.action === "run") {
         const r = startRun(mission, { max: params.max, dryRun: params.dryRun }, notify, ctx.cwd);
         text = r.text;

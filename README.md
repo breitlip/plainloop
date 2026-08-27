@@ -51,12 +51,21 @@ Verify with `pi list`, then restart pi (or start a new session) so the
 The package ships a pi extension, so in any pi session (TUI, RPC, pi-web):
 
 ```text
-/plainloop status [mission]                 # progress (mission auto-detected from ./missions/)
+/plainloop status [mission]                 # progress, liveness, log tail, work summary
 /plainloop run <mission> [--max N] [--dry-run]
 /plainloop stop [mission]
+/plainloop list [mission]                   # the mission's pi sessions (open them in pi-web)
 /plainloop version                          # installed extension version + install path
 /plainloop help
 ```
+
+`status` answers "is it actually running?" — driver pid liveness, last log
+activity, the last `driver.log` lines, plus a work summary (latest completed
+task, CURRENT.md, STATE.md).
+
+`list` shows every plainloop session for the mission (parent, task-NNNN,
+review-NNNN) with last activity and size — they live in pi-web under the
+session cwd (the repo root by default).
 
 `version` is handy for checking what is actually loaded, since pi-web's
 Settings → Pi packages panel only shows the source and install path, not

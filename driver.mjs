@@ -26,14 +26,18 @@ import { spawn, execSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   renameSync,
   rmSync,
   statSync,
   appendFileSync,
+  closeSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 
 // Windows: `pi` is an extensionless shim; spawn needs `pi.cmd` + shell:true.
@@ -145,6 +149,99 @@ function shOutput(cmd, cwd) {
 /** Nearest git worktree root at or above dir ("" if none). */
 function gitRoot(dir) {
   return shOutput("git rev-parse --show-toplevel", dir);
+}
+
+// ---------------------------------------------------------------------------
+// session discovery (for `list` — where to find the sessions in pi-web)
+// ---------------------------------------------------------------------------
+
+const normPath = (p) => p.replace(/\//g, "\\").toLowerCase();
+
+function fmtSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Find the plainloop pi sessions for a mission by scanning the
+ * ~/.pi/agent/sessions directories: line 1 of each .jsonl carries the cwd,
+ * and a session_info entry carries the name
+ * (plainloop-{parent|task-NNNN|review-NNNN}-<mission>).
+ */
+function findMissionSessions(missionDir, sessionCwd) {
+  const sessionsRoot = path.join(homedir(), ".pi", "agent", "sessions");
+  const missionName = path.basename(missionDir);
+  const suffix = `-${missionName}`;
+  const wantedCwd = normPath(sessionCwd);
+  const out = [];
+  if (!existsSync(sessionsRoot)) return out;
+
+  for (const dir of readdirSync(sessionsRoot, { withFileTypes: true })) {
+    if (!dir.isDirectory()) continue;
+    let files;
+    try {
+      files = readdirSync(path.join(sessionsRoot, dir.name));
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!f.endsWith(".jsonl")) continue;
+      const file = path.join(sessionsRoot, dir.name, f);
+      try {
+        const fd = openSync(file, "r");
+        const buf = Buffer.alloc(65536);
+        const n = readSync(fd, buf, 0, buf.length, 0);
+        closeSync(fd);
+        const lines = buf.toString("utf8", 0, n).split("\n").filter(Boolean);
+        if (lines.length === 0) continue;
+        const head = JSON.parse(lines[0]);
+        if (head.type !== "session" || normPath(head.cwd) !== wantedCwd) continue;
+        let name;
+        for (const line of lines) {
+          if (!line.includes("\"session_info\"")) continue;
+          const rec = JSON.parse(line);
+          if (rec.type === "session_info" && rec.name) name = rec.name; // last wins (renames)
+        }
+        if (!name || !name.startsWith("plainloop-") || !name.endsWith(suffix)) continue;
+        const st = statSync(file);
+        out.push({ name, file, mtime: st.mtimeMs, size: st.size });
+      } catch {
+        continue; // unreadable / truncated — skip
+      }
+    }
+  }
+
+  const roleKey = (name) => {
+    const role = name.slice("plainloop-".length, name.length - suffix.length);
+    if (role === "parent") return [0, 0];
+    const m = role.match(/^(task|review)-?(\d+)$/);
+    return m ? [m[1] === "task" ? 1 : 2, Number(m[2])] : [3, 0];
+  };
+  return out.sort((a, b) => {
+    const [ra, na] = roleKey(a.name);
+    const [rb, nb] = roleKey(b.name);
+    return ra - rb || na - nb || a.name.localeCompare(b.name);
+  });
+}
+
+function cmdList(missionDir, cfg) {
+  const sessionCwd = cfg.sessionCwd ?? (gitRoot(missionDir) || missionDir);
+  const sessions = findMissionSessions(missionDir, sessionCwd);
+  console.log(`mission:    ${missionDir}`);
+  console.log(`sessions in pi-web under: ${sessionCwd}`);
+  if (sessions.length === 0) {
+    console.log(`(no plainloop sessions found for this mission)`);
+    return;
+  }
+  const suffix = `-${path.basename(missionDir)}`;
+  console.log(`\n  role       name                                         last activity   size`);
+  for (const s of sessions) {
+    const role = s.name.slice("plainloop-".length, s.name.length - suffix.length).padEnd(10);
+    const name = s.name.padEnd(46);
+    const age = ageStr(Date.now() - s.mtime).padStart(12);
+    console.log(`  ${role} ${name} ${age} ${fmtSize(s.size)}`);
+  }
 }
 
 function historyTasks(missionDir) {
@@ -397,6 +494,33 @@ function cmdStatus(missionDir, cfg) {
   if (existsSync(errFile) && statSync(errFile).size > 0) {
     console.log(`driver.err.log: ${statSync(errFile).size} bytes — check it`);
     for (const l of tailLines(errFile, 3)) console.log(`  ! ${l}`);
+  }
+
+  // work summary: what was done, what is in flight, durable state
+  const firstLines = (file, n) => {
+    if (!existsSync(file)) return null;
+    return readFileSync(file, "utf8")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l !== "")
+      .slice(0, n);
+  };
+  const latest = done.length > 0 ? done[done.length - 1] : null;
+  const latestBrief = latest !== null ? firstLines(path.join(missionDir, "history", `TASK-${String(latest).padStart(4, "0")}.md`), 1) : null;
+  const current = firstLines(path.join(missionDir, "CURRENT.md"), 3);
+  const stateLines = firstLines(path.join(missionDir, "STATE.md"), 3);
+  if (latestBrief || current || stateLines) {
+    console.log("");
+    console.log(`work summary:`);
+    if (latestBrief) console.log(`  latest done:  task ${latest} — ${latestBrief[0]}`);
+    if (current) {
+      console.log(`  current (CURRENT.md):`);
+      for (const l of current) console.log(`    ${l}`);
+    }
+    if (stateLines) {
+      console.log(`  state (STATE.md):`);
+      for (const l of stateLines) console.log(`    ${l}`);
+    }
   }
 }
 
@@ -719,6 +843,8 @@ function flagValue(name, dflt) {
 try {
   if (cmd === "status" && args[0]) {
     cmdStatus(path.resolve(args[0]), loadDriverConfig(path.resolve(args[0])));
+  } else if (cmd === "list" && args[0]) {
+    cmdList(path.resolve(args[0]), loadDriverConfig(path.resolve(args[0])));
   } else if (cmd === "run" && args[0]) {
     const missionDir = path.resolve(args[0]);
     const code = await cmdRun(missionDir, {
@@ -733,7 +859,8 @@ try {
     console.log(
       "usage:\n" +
         "  node driver.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]\n" +
-        "  node driver.mjs status <mission-dir>",
+        "  node driver.mjs status <mission-dir>\n" +
+        "  node driver.mjs list <mission-dir>",
     );
     process.exitCode = 2;
   }
