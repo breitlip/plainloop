@@ -119,6 +119,14 @@ export default function plainloop(pi: ExtensionAPI) {
     if (!pid) return { ok: false, text: "no running plainloop found for this mission" };
     try {
       process.kill(pid, "SIGTERM");
+      // the driver's SIGTERM handler clears the pidfile; remove it as a fallback
+      setTimeout(() => {
+        try {
+          rmSync(pidFileOf(mission), { force: true });
+        } catch {
+          /* gone already */
+        }
+      }, 1500).unref?.();
       return { ok: true, text: `sent SIGTERM to pid ${pid}` };
     } catch (e) {
       return { ok: false, text: `kill failed: ${(e as Error).message}` };

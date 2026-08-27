@@ -38,6 +38,33 @@ import path from "node:path";
 
 const PI_BIN = process.env.PI_BIN ?? "pi";
 
+/** Live RPC sessions, so signals can reap them. */
+const liveSessions = new Set();
+
+let cleanupDone = false;
+let currentPidFile = null;
+function shutdown(code) {
+  if (cleanupDone) return;
+  cleanupDone = true;
+  if (currentPidFile) {
+    try {
+      rmSync(currentPidFile, { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+  for (const s of liveSessions) {
+    try {
+      s.kill();
+    } catch {
+      /* already gone */
+    }
+  }
+  process.exit(code);
+}
+process.on("SIGTERM", () => shutdown(143));
+process.on("SIGINT", () => shutdown(130));
+
 // ---------------------------------------------------------------------------
 // driver.json contract
 // ---------------------------------------------------------------------------
@@ -157,6 +184,7 @@ class RpcSession {
       { cwd, stdio: ["pipe", "pipe", "pipe"] },
     );
     this.alive = true;
+    liveSessions.add(this);
     this.proc.on("exit", () => {
       this.alive = false;
       for (const { reject } of this.pending.values())
@@ -294,6 +322,7 @@ class RpcSession {
   }
 
   kill() {
+    liveSessions.delete(this);
     if (this.alive) this.proc.kill("SIGTERM");
   }
 }
@@ -375,10 +404,12 @@ async function cmdRun(missionDir, opts) {
   }
 
   // pidfile so `/plainloop stop` (or a human) can find this run
-  writeFileSync(path.join(missionDir, ".plainloop.pid"), String(process.pid));
+  const pidFile = path.join(missionDir, ".plainloop.pid");
+  currentPidFile = pidFile;
+  writeFileSync(pidFile, String(process.pid));
   const clearPid = () => {
     try {
-      rmSync(path.join(missionDir, ".plainloop.pid"), { force: true });
+      rmSync(pidFile, { force: true });
     } catch {}
   };
 
