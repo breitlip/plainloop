@@ -29,6 +29,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   statSync,
   appendFileSync,
   writeFileSync,
@@ -373,6 +374,14 @@ async function cmdRun(missionDir, opts) {
     return 0;
   }
 
+  // pidfile so `/plainloop stop` (or a human) can find this run
+  writeFileSync(path.join(missionDir, ".plainloop.pid"), String(process.pid));
+  const clearPid = () => {
+    try {
+      rmSync(path.join(missionDir, ".plainloop.pid"), { force: true });
+    } catch {}
+  };
+
   logLine(
     missionDir,
     `run started (max=${opts.max ?? "∞"}, workerTimeout=${cfg.workerTimeoutSec}s)`,
@@ -591,6 +600,7 @@ async function cmdRun(missionDir, opts) {
     console.log(`\ndriver: ${stopReason} — ${iterations} iteration(s) this run`);
     return stopReason === "completed" || stopReason.startsWith("exit") ? 0 : 1;
   } finally {
+    clearPid();
     parent.kill();
   }
 }

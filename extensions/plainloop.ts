@@ -1,0 +1,251 @@
+/**
+ * plainloop extension — slash command + tool for driving plainloop missions
+ * from inside pi (TUI, RPC, pi-web).
+ *
+ *   /plainloop status [mission]            show mission status
+ *   /plainloop run <mission> [--max N] [--dry-run]
+ *   /plainloop stop [mission]              stop a running mission
+ *   /plainloop help
+ *
+ * `run` starts the driver as a detached background process (the driver
+ * writes <mission>/.plainloop.pid); the session stays responsive and a
+ * notification is posted when the run finishes.
+ */
+
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { spawn, spawnSync } from "node:child_process";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+} from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const DRIVER = path.resolve(here, "..", "driver.mjs");
+const NODE = process.execPath;
+
+export default function plainloop(pi: ExtensionAPI) {
+  // ------------------------------------------------------------------ utils
+
+  const pidFileOf = (mission: string) => path.join(mission, ".plainloop.pid");
+
+  function livePid(mission: string): number | null {
+    const f = pidFileOf(mission);
+    if (!existsSync(f)) return null;
+    const pid = Number(readFileSync(f, "utf8").trim());
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    try {
+      process.kill(pid, 0); // raises if not alive
+      return pid;
+    } catch {
+      return null;
+    }
+  }
+
+  type MissionResolution =
+    | { ok: true; mission: string }
+    | { ok: false; error: string; list?: string[] };
+
+  function resolveMission(arg?: string): MissionResolution {
+    if (arg) {
+      const m = path.resolve(arg);
+      if (existsSync(path.join(m, "MISSION.md"))) return { ok: true, mission: m };
+      return { ok: false, error: `no MISSION.md in ${m}` };
+    }
+    const root = path.join(process.cwd(), "missions");
+    if (!existsSync(root))
+      return { ok: false, error: "no mission given and no ./missions/ directory here" };
+    const list = readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && existsSync(path.join(root, e.name, "MISSION.md")))
+      .map((e) => path.join(root, e.name));
+    if (list.length === 0) return { ok: false, error: `no missions (with MISSION.md) in ${root}` };
+    if (list.length === 1) return { ok: true, mission: list[0] };
+    return { ok: false, error: "multiple missions found — pass one explicitly", list };
+  }
+
+  function runStatus(mission: string): string {
+    const r = spawnSync(NODE, [DRIVER, "status", mission], { encoding: "utf8" });
+    const out = (r.stdout || "").trim();
+    const err = (r.stderr || "").trim();
+    return out + (err ? `\n${err}` : "");
+  }
+
+  function startRun(
+    mission: string,
+    opts: { max?: number; dryRun?: boolean },
+    notify: (text: string, kind?: "info" | "error" | "warning") => void,
+  ): { ok: boolean; text: string } {
+    const existing = livePid(mission);
+    if (existing)
+      return { ok: false, text: `already running (pid ${existing}) — stop it first: /plainloop stop ${mission}` };
+
+    const args = [DRIVER, "run", mission];
+    if (opts.max !== undefined) args.push("--max", String(opts.max));
+    if (opts.dryRun) args.push("--dry-run");
+    args.push("--verbose");
+
+    const child = spawn(NODE, args, {
+      cwd: process.cwd(),
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    const pid = child.pid;
+    child.on("exit", (code) => {
+      try {
+        rmSync(pidFileOf(mission), { force: true });
+      } catch {
+        /* driver already cleaned up */
+      }
+      notify(
+        code === 0
+          ? `plainloop: run finished (exit 0) — ${path.basename(mission)}`
+          : `plainloop: run finished (exit ${code ?? "signal"}) — check ${path.join(mission, "driver.log")}`,
+        code === 0 ? "info" : "warning",
+      );
+    });
+    return {
+      ok: true,
+      text: `started (pid ${pid}) — log: ${path.join(mission, "driver.log")}; stop with /plainloop stop ${mission}`,
+    };
+  }
+
+  function stopRun(mission: string): { ok: boolean; text: string } {
+    const pid = livePid(mission);
+    if (!pid) return { ok: false, text: "no running plainloop found for this mission" };
+    try {
+      process.kill(pid, "SIGTERM");
+      return { ok: true, text: `sent SIGTERM to pid ${pid}` };
+    } catch (e) {
+      return { ok: false, text: `kill failed: ${(e as Error).message}` };
+    }
+  }
+
+  // ------------------------------------------------------------- /plainloop
+
+  pi.registerCommand("plainloop", {
+    description:
+      "Drive plainloop missions: /plainloop [status|run|stop|help] [mission] [--max N] [--dry-run]",
+    handler: async (args, ctx) => {
+      const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const flags: Record<string, string> = {};
+      const positional: string[] = [];
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i] === "--max" && parts[i + 1]) flags.max = parts[++i];
+        else if (parts[i] === "--dry-run") flags.dryRun = "1";
+        else positional.push(parts[i]);
+      }
+      const [action = "status", missionArg] = positional;
+
+      const notify = (text: string, kind: "info" | "error" | "warning" = "info") => {
+        try {
+          ctx.ui.notify(text, kind);
+        } catch {
+          /* headless mode: nothing to display on */
+        }
+      };
+
+      if (action === "help") {
+        notify(
+          [
+            "/plainloop status [mission] — show status (mission auto-detected from ./missions/)",
+            "/plainloop run <mission> [--max N] [--dry-run] — start a background run",
+            "/plainloop stop [mission] — stop a running mission",
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+
+      const res = resolveMission(missionArg);
+      if (!res.ok) {
+        notify(res.list ? `${res.error}\n${res.list.join("\n")}` : res.error, "error");
+        return;
+      }
+      const mission = res.mission;
+
+      if (action === "status") {
+        notify(runStatus(mission), "info");
+        return;
+      }
+      if (action === "run") {
+        const r = startRun(mission, { max: flags.max ? Number(flags.max) : undefined, dryRun: Boolean(flags.dryRun) }, notify);
+        notify(r.text, r.ok ? "info" : "error");
+        return;
+      }
+      if (action === "stop") {
+        const r = stopRun(mission);
+        notify(r.text, r.ok ? "info" : "error");
+        return;
+      }
+      notify(`unknown action "${action}" — try /plainloop help`, "error");
+    },
+  });
+
+  // ----------------------------------------------------------------- tool
+
+  pi.registerTool({
+    name: "plainloop",
+    label: "Plainloop",
+    description:
+      "Drive a plainloop mission (a directory with MISSION.md, STATE.md, TASK.md, history/). " +
+      "Actions: 'status' shows progress; 'run' starts a background driver run (optionally capped " +
+      "with max iterations) and returns immediately; 'stop' terminates a running mission. " +
+      "Omit mission to auto-detect the single mission under ./missions/.",
+    parameters: Type.Object({
+      action: Type.Union(
+        [Type.Literal("run"), Type.Literal("status"), Type.Literal("stop")],
+        { description: "What to do with the mission" },
+      ),
+      mission: Type.Optional(
+        Type.String({
+          description:
+            "Mission directory (absolute or cwd-relative). Omit to auto-detect the single mission under ./missions/.",
+        }),
+      ),
+      max: Type.Optional(
+        Type.Number({ description: "Stop this run after N iterations (action=run only)" }),
+      ),
+      dryRun: Type.Optional(
+        Type.Boolean({ description: "Print rendered prompts, spawn nothing (action=run only)" }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const notify = (text: string, kind: "info" | "error" | "warning" = "info") => {
+        try {
+          ctx.ui.notify(text, kind);
+        } catch {
+          /* headless modes: the tool result carries the message */
+        }
+      };
+
+      const res = resolveMission(params.mission);
+      if (!res.ok) {
+        const text = res.list ? `${res.error}\n${res.list.join("\n")}` : res.error;
+        notify(text, "error");
+        return { content: [{ type: "text", text }], details: { ok: false } };
+      }
+      const mission = res.mission;
+
+      let text: string;
+      let ok = true;
+      if (params.action === "status") {
+        text = runStatus(mission);
+      } else if (params.action === "run") {
+        const r = startRun(mission, { max: params.max, dryRun: params.dryRun }, notify);
+        text = r.text;
+        ok = r.ok;
+      } else {
+        const r = stopRun(mission);
+        text = r.text;
+        ok = r.ok;
+      }
+      notify(text, ok ? "info" : "error");
+      return { content: [{ type: "text", text }], details: { ok, mission } };
+    },
+  });
+}

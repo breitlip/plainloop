@@ -21,7 +21,26 @@ plainloop/driver.mjs (no LLM context)
 All sessions are normal pi sessions — visible in pi-web and in
 `~/.pi/agent/sessions/`.
 
-## Usage
+## Using from inside pi
+
+The package ships a pi extension, so in any pi session (TUI, RPC, pi-web):
+
+```text
+/plainloop status [mission]                 # progress (mission auto-detected from ./missions/)
+/plainloop run <mission> [--max N] [--dry-run]
+/plainloop stop [mission]
+/plainloop help
+```
+
+`run` starts the driver as a detached background process — the session stays
+responsive and you get a notification when the run finishes. The driver also
+writes `<mission>/.plainloop.pid`, so `stop` works even if the starting
+session is gone.
+
+There is also a `plainloop` tool, so you can simply ask the agent:
+*"run the count mission for 20 iterations and tell me the result".*
+
+## Usage (shell)
 
 ```bash
 node driver.mjs run missions/count-to-1000 --max 5 --verbose
