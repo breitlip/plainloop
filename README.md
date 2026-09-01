@@ -122,6 +122,7 @@ Flags:
 | `sessionCwd` | git root | cwd for the spawned pi sessions (pi keys sessions by cwd — defaulting to the repo root keeps them visible under the project in pi-web). Mission dir if no git root |
 | `compactEvery` | `5` | Compact the parent session after every N completed tasks |
 | `compactInstructions` | see driver | Focus instructions for the parent compaction |
+| `parentTimeoutSec` | `180` | Parent run timeout (writing `TASK.md`) before the driver gives up |
 | `workerTimeoutSec` | `240` | Worker run timeout before the driver steers it |
 | `steerGraceSec` | `60` | Grace period after steering before aborting |
 | `maxRetries` | `1` | Worker retries per task (each retry gets a parent-written corrective TASK.md) |

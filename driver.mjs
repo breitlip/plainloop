@@ -97,6 +97,7 @@ const DEFAULTS = {
   compactInstructions:
     "Preserve: mission dir, current mission state, next task number, " +
     "loop protocol status, and any open failures.",
+  parentTimeoutSec: 180,
   workerTimeoutSec: 240,
   steerGraceSec: 60,
   maxRetries: 1,
@@ -628,7 +629,10 @@ async function cmdRun(missionDir, opts) {
       // --- parent: write the task brief -----------------------------------
       let parentSaid = "";
       try {
-        parentSaid = await parent.prompt(render(cfg.taskPrompt, v), 180_000);
+        parentSaid = await parent.prompt(
+          render(cfg.taskPrompt, v),
+          cfg.parentTimeoutSec * 1000,
+        );
       } catch (e) {
         logLine(missionDir, `task ${n}: parent failed: ${e.message}`, verbose);
         stopReason = `parent failed: ${e.message}`;
