@@ -24,6 +24,8 @@ Every mission lives in its own directory:
 ├── STATE.md        # durable knowledge only — no per-iteration log
 ├── TASK.md         # the current task brief, written by the parent
 ├── CURRENT.md      # session scratch: what this session is doing, partial results
+├── INBOX.md        # optional drop-in entries, drained by the driver each iteration
+├── events.jsonl    # append-only timestamped driver event log
 └── history/        # completed task briefs: TASK-001.md, TASK-002.md, ...
 ```
 
@@ -198,6 +200,24 @@ Reference implementation flow per task:
 5. driver: archive TASK.md → `history/TASK-NNNN.md`
 6. every N tasks: driver compacts the parent
 7. `exit` command succeeds, or parent says STOP → done
+
+## Inbox, scheduled execution, event log
+
+- **INBOX.md** — drop-in entries you can append at *any* time (no timing
+  between iterations needed). Entry format: a `## [ISO-8601] summary` block.
+  The driver drains new entries at the start of each iteration and hands them
+  to the parent for routing: durable knowledge → STATE.md, direction →
+  MISSION.md, next-step context → TASK.md.
+- **Execution-time headers** — `TASK.md` and inbox entries accept an optional
+  `Execute at: <ISO-8601>` or `Execute when: <shell condition>`; **absent =
+  immediate**. The driver parks the loop (logged) until the time is reached or
+  the condition succeeds.
+- **Hot path (opt-in, `steerOnInbox`)** — new inbox entries while the worker
+  runs steer the live worker session; `priority: stop` in an entry aborts it.
+- **events.jsonl** — append-only `{ts, event, detail}` log of every driver
+  action (task start, worker settle/timeout, verify, review, archive, inbox
+  drain, wait begin/end). `status` renders the last events and the current
+  phase: `run — worker (task 3)` or `wait until … (remaining hh:mm:ss)`.
 
 ## Relay driver (pi-web)
 

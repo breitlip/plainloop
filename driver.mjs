@@ -15,6 +15,8 @@
  *   TASK.md      current task brief (parent writes, worker executes)
  *   CURRENT.md   worker scratch
  *   history/     completed task briefs: TASK-0001.md, ...
+ *   INBOX.md     optional drop-in entries, drained by the driver each iteration
+ *   events.jsonl append-only timestamped driver event log
  *   driver.json  machine-readable driver contract (see README.md)
  *
  * Usage:
@@ -51,12 +53,20 @@ const liveSessions = new Set();
 
 let cleanupDone = false;
 let currentPidFile = null;
+let currentStateFile = null;
 function shutdown(code) {
   if (cleanupDone) return;
   cleanupDone = true;
   if (currentPidFile) {
     try {
       rmSync(currentPidFile, { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+  if (currentStateFile) {
+    try {
+      rmSync(currentStateFile, { force: true });
     } catch {
       /* best effort */
     }
@@ -92,6 +102,9 @@ const DEFAULTS = {
     "Otherwise write TASK.md and reply exactly: READY.",
   verify: null, // shell command, run in mission dir; template vars allowed
   exit: null, // shell command, run in mission dir; success => mission done
+  wait: null, // execution gate: {at:"ISO-8601"} or {command, intervalMs, timeoutMs}
+  steerOnInbox: false, // hot path: steer the running worker on new INBOX.md entries
+  inboxPollMs: 5000, // inbox poll interval while the worker runs (steerOnInbox)
   countPattern: null, // regex with one capture group, matched in STATE.md
   compactEvery: 5,
   compactInstructions:
@@ -230,6 +243,8 @@ function cmdList(missionDir, cfg) {
   const sessionCwd = cfg.sessionCwd ?? (gitRoot(missionDir) || missionDir);
   const sessions = findMissionSessions(missionDir, sessionCwd);
   console.log(`mission:    ${missionDir}`);
+  const cur = currentStateLine(missionDir);
+  if (cur) console.log(`current:    ${cur}`);
   console.log(`sessions in pi-web under: ${sessionCwd}`);
   if (sessions.length === 0) {
     console.log(`(no plainloop sessions found for this mission)`);
@@ -259,6 +274,238 @@ function logLine(missionDir, line, verbose) {
   const msg = `${stamp} ${line}\n`;
   appendFileSync(path.join(missionDir, "driver.log"), msg);
   if (verbose) process.stdout.write(msg);
+}
+
+/** Append one timestamped event to events.jsonl (best effort). */
+function event(missionDir, name, detail = {}) {
+  try {
+    appendFileSync(
+      path.join(missionDir, "events.jsonl"),
+      JSON.stringify({ ts: new Date().toISOString(), event: name, ...detail }) + "\n",
+    );
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Write the driver's current phase (best effort) for `status`/`list`. */
+function writeState(missionDir, phase, extra = {}) {
+  const file = path.join(missionDir, ".plainloop.state.json");
+  try {
+    writeFileSync(file, JSON.stringify({ phase, since: new Date().toISOString(), ...extra }));
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Render the driver's current phase (run / wait) from .plainloop.state.json. */
+function currentStateLine(missionDir) {
+  const file = path.join(missionDir, ".plainloop.state.json");
+  if (!existsSync(file)) return null;
+  let st;
+  try {
+    st = JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+  const p2 = (x) => String(x).padStart(2, "0");
+  const hhmmss = (ms) => {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    return `${p2(Math.floor(s / 3600))}:${p2(Math.floor((s % 3600) / 60))}:${p2(s % 60)}`;
+  };
+  if (st.phase === "waiting") {
+    if (st.until) {
+      const rem = Math.max(0, st.until - Date.now());
+      return `wait until ${new Date(st.until).toISOString()} (remaining ${hhmmss(rem)}) — ${st.label ?? "wait"}`;
+    }
+    return `wait — polling \`${st.command ?? "?"}\` (since ${st.since ?? "?"}) — ${st.label ?? "wait"}`;
+  }
+  return `run — ${st.phase}${st.task !== undefined ? ` (task ${st.task})` : ""} (since ${st.since ?? "?"})`;
+}
+
+// ---------------------------------------------------------------------------
+// inbox (INBOX.md) — drop-in entries, drained by the driver
+// ---------------------------------------------------------------------------
+
+/** Split INBOX.md into entry blocks (blocks start with a `## [` header line). */
+function parseInbox(text) {
+  const entries = [];
+  let cur = null;
+  for (const line of text.split("\n")) {
+    if (/^##\s+\[/.test(line)) {
+      if (cur) entries.push(cur);
+      cur = [line];
+    } else if (cur) cur.push(line);
+  }
+  if (cur) entries.push(cur);
+  return entries.map((ls) => ls.join("\n").replace(/\n+$/, ""));
+}
+
+/**
+ * Return entries appended since the last drain and advance the drain cursor
+ * (.plainloop.inbox.json). Safe across driver restarts; a rewritten file
+ * (fewer entries than drained) resets the cursor.
+ */
+function newInboxEntries(missionDir) {
+  const file = path.join(missionDir, "INBOX.md");
+  if (!existsSync(file)) return [];
+  const st = statSync(file);
+  const entries = parseInbox(readFileSync(file, "utf8"));
+  const stateFile = path.join(missionDir, ".plainloop.inbox.json");
+  let state = { mtimeMs: 0, drainedCount: 0 };
+  try {
+    state = JSON.parse(readFileSync(stateFile, "utf8"));
+  } catch {
+    /* first drain */
+  }
+  if (entries.length < state.drainedCount) state = { mtimeMs: 0, drainedCount: 0 };
+  const fresh = entries.slice(state.drainedCount);
+  if (st.mtimeMs > state.mtimeMs || fresh.length > 0)
+    writeFileSync(stateFile, JSON.stringify({ mtimeMs: st.mtimeMs, drainedCount: entries.length }));
+  return fresh;
+}
+
+// ---------------------------------------------------------------------------
+// execution-time gates (Execute at: / Execute when: headers)
+// ---------------------------------------------------------------------------
+
+/** Parse an optional `Execute at:` / `Execute when:` header from text. */
+function execSpecFromText(text) {
+  const at = text.match(/^\s*Execute\s+at:\s*(.+)$/im);
+  if (at) {
+    const t = Date.parse(at[1].trim());
+    if (Number.isFinite(t)) return { kind: "at", value: t };
+  }
+  const when = text.match(/^\s*Execute\s+when:\s*(.+)$/im);
+  if (when) return { kind: "when", command: when[1].trim() };
+  return null;
+}
+
+/** Normalize driver.json `wait` into an exec spec (or null). */
+function cfgWaitSpec(cfg) {
+  if (!cfg.wait || typeof cfg.wait !== "object") return null;
+  if (cfg.wait.at) {
+    const t = Date.parse(cfg.wait.at);
+    if (Number.isFinite(t)) return { kind: "at", value: t };
+  }
+  if (cfg.wait.command)
+    return {
+      kind: "when",
+      command: cfg.wait.command,
+      intervalMs: cfg.wait.intervalMs ?? 30_000,
+      timeoutMs: cfg.wait.timeoutMs ?? 0,
+    };
+  return null;
+}
+
+/**
+ * Park the loop until the spec is satisfied. Sleeps in 1s chunks so SIGTERM
+ * stays responsive; `when` polls a shell condition (timeoutMs 0 = wait forever).
+ */
+async function awaitSpec(missionDir, spec, label, verbose) {
+  if (!spec) return;
+  if (spec.kind === "at") {
+    let delay = spec.value - Date.now();
+    if (delay <= 0) return;
+    writeState(missionDir, "waiting", { label, kind: "at", until: spec.value });
+    logLine(
+      missionDir,
+      `wait (${label}): until ${new Date(spec.value).toISOString()} (~${Math.round(delay / 1000)}s)`,
+      verbose,
+    );
+    event(missionDir, "wait_start", { label, kind: "at", until: new Date(spec.value).toISOString() });
+    while (delay > 0) {
+      await new Promise((r) => setTimeout(r, Math.min(delay, 1000)));
+      delay = spec.value - Date.now();
+    }
+    logLine(missionDir, `wait (${label}): time reached`, verbose);
+    event(missionDir, "wait_end", { label, kind: "at" });
+    return;
+  }
+  const intervalMs = spec.intervalMs ?? 30_000;
+  const timeoutMs = spec.timeoutMs ?? 0;
+  const started = Date.now();
+  writeState(missionDir, "waiting", { label, kind: "when", command: spec.command });
+  logLine(missionDir, `wait (${label}): polling \`${spec.command}\` every ${Math.round(intervalMs / 1000)}s`, verbose);
+  event(missionDir, "wait_start", { label, kind: "when", command: spec.command });
+  for (;;) {
+    if (sh(spec.command, missionDir)) break;
+    if (timeoutMs > 0 && Date.now() - started > timeoutMs) {
+      logLine(missionDir, `wait (${label}): timeout — continuing anyway`, verbose);
+      event(missionDir, "wait_timeout", { label, kind: "when" });
+      return;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  logLine(missionDir, `wait (${label}): condition met after ${((Date.now() - started) / 1000).toFixed(0)}s`, verbose);
+  event(missionDir, "wait_end", { label, kind: "when" });
+}
+
+/**
+ * Worker prompt with inbox watching (hot path, `steerOnInbox`): waits for
+ * `agent_settled` in short chunks; new INBOX.md entries steer the live worker
+ * (`priority: stop` aborts instead). Same timeout semantics as prompt().
+ */
+async function workerPromptWatchingInbox(worker, missionDir, cfg, message, timeoutMs, verbose) {
+  await worker.sendOk({ type: "prompt", message }, 10_000);
+  const since = worker.events.length;
+  const deadline = Date.now() + timeoutMs;
+  const pollMs = Math.max(1000, cfg.inboxPollMs ?? 5000);
+  const inboxFile = path.join(missionDir, "INBOX.md");
+  const mtimeOf = () => {
+    try {
+      return statSync(inboxFile).mtimeMs;
+    } catch {
+      return 0;
+    }
+  };
+  let baseline = mtimeOf();
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`${worker.label}: timeout after ${timeoutMs / 1000}s`);
+    try {
+      await worker.waitForEventSince("agent_settled", since, Math.min(remaining, pollMs));
+      return worker.lastAssistantTextSince(since);
+    } catch (e) {
+      if (!/event timeout/.test(e.message)) throw e;
+      /* chunk expired — fall through to the inbox check */
+    }
+    if (mtimeOf() > baseline) {
+      const fresh = newInboxEntries(missionDir); // advances the drain cursor
+      if (fresh.length > 0) {
+        if (fresh.some((entry) => /^\s*priority:\s*stop\s*$/im.test(entry))) {
+          logLine(missionDir, `inbox: priority:stop — aborting worker`, verbose);
+          event(missionDir, "inbox_abort", { entries: fresh.length });
+          try {
+            await worker.sendOk({ type: "abort" }, 15_000);
+          } catch {
+            /* best effort */
+          }
+          throw new Error(`${worker.label}: aborted by inbox (priority: stop)`);
+        }
+        logLine(
+          missionDir,
+          `inbox: steering worker with ${fresh.length} new entr${fresh.length === 1 ? "y" : "ies"}`,
+          verbose,
+        );
+        event(missionDir, "inbox_steer", { entries: fresh.length });
+        try {
+          await worker.sendOk(
+            {
+              type: "steer",
+              message:
+                "New mission inbox entries (incorporate them now, then finish TASK.md):\n\n" +
+                fresh.join("\n\n---\n\n"),
+            },
+            15_000,
+          );
+        } catch (se) {
+          logLine(missionDir, `inbox: steer failed: ${se.message}`, verbose);
+        }
+      }
+      baseline = mtimeOf();
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +715,8 @@ function cmdStatus(missionDir, cfg) {
     ? (state.match(new RegExp(cfg.countPattern)) ?? [])[1]
     : undefined;
   console.log(`mission:      ${missionDir}`);
+  const cur = currentStateLine(missionDir);
+  if (cur) console.log(`current:      ${cur}`);
   console.log(`completed:    ${done.length} tasks${count !== undefined ? ` (count: ${count})` : ""}`);
   console.log(`next task:    ${done.length + 1}`);
   if (existsSync(path.join(missionDir, "TASK.md")))
@@ -490,6 +739,21 @@ function cmdStatus(missionDir, cfg) {
     const st = statSync(logFile);
     console.log(`driver.log:   ${st.size} bytes, last activity ${ageStr(Date.now() - st.mtimeMs)}`);
     for (const l of tailLines(logFile, 3)) console.log(`  | ${l}`);
+  }
+  const evFile = path.join(missionDir, "events.jsonl");
+  if (existsSync(evFile)) {
+    console.log(`events.jsonl: last events:`);
+    for (const l of tailLines(evFile, 5)) {
+      let line = l;
+      try {
+        const r = JSON.parse(l);
+        const detail = Object.fromEntries(Object.entries(r).filter(([k]) => !["ts", "event"].includes(k)));
+        line = `${r.ts}  ${r.event}${Object.keys(detail).length ? "  " + JSON.stringify(detail) : ""}`;
+      } catch {
+        /* keep raw line */
+      }
+      console.log(`  | ${line}`);
+    }
   }
   const errFile = path.join(missionDir, "driver.err.log");
   if (existsSync(errFile) && statSync(errFile).size > 0) {
@@ -572,6 +836,9 @@ async function cmdRun(missionDir, opts) {
     console.log(`  worker prompt:${render(cfg.workerPrompt, v)}`);
     console.log(`  verify:       ${cfg.verify ?? "(none — parent decides)"}`);
     console.log(`  exit:         ${cfg.exit ?? "(none — parent decides)"}`);
+    console.log(`  inbox:        ${existsSync(path.join(missionDir, "INBOX.md")) ? "present" : "(none)"}`);
+    console.log(`  wait:         ${cfg.wait ? JSON.stringify(cfg.wait) : "(none)"}`);
+    console.log(`  steerOnInbox: ${cfg.steerOnInbox}`);
     return 0;
   }
 
@@ -584,9 +851,15 @@ async function cmdRun(missionDir, opts) {
   const pidFile = path.join(missionDir, ".plainloop.pid");
   currentPidFile = pidFile;
   writeFileSync(pidFile, String(process.pid));
+  currentStateFile = path.join(missionDir, ".plainloop.state.json");
   const clearPid = () => {
     try {
       rmSync(pidFile, { force: true });
+    } catch {}
+  };
+  const clearState = () => {
+    try {
+      rmSync(currentStateFile, { force: true });
     } catch {}
   };
 
@@ -595,6 +868,7 @@ async function cmdRun(missionDir, opts) {
     `run started (max=${opts.max ?? "∞"}, workerTimeout=${cfg.workerTimeoutSec}s)`,
     verbose,
   );
+  event(missionDir, "run_start", { max: opts.max ?? null });
 
   const parent = new RpcSession({
     name: `plainloop-parent-${missionName}`,
@@ -624,13 +898,41 @@ async function cmdRun(missionDir, opts) {
 
       const v = vars();
       const n = v.n;
+
+      // --- inbox: drain new entries (cold path) -----------------------------
+      const inboxEntries = newInboxEntries(missionDir);
+      let waited = false;
+      if (inboxEntries.length > 0) {
+        logLine(
+          missionDir,
+          `task ${n}: inbox drained ${inboxEntries.length} new entr${inboxEntries.length === 1 ? "y" : "ies"}`,
+          verbose,
+        );
+        event(missionDir, "inbox_drain", { task: n, entries: inboxEntries.length });
+        const inboxSpec = inboxEntries.map(execSpecFromText).find(Boolean) ?? null;
+        if (inboxSpec) {
+          await awaitSpec(missionDir, inboxSpec, "inbox", verbose);
+          waited = true;
+        }
+      }
+
       logLine(missionDir, `task ${n}: parent writing TASK.md …`, verbose);
+      event(missionDir, "task_start", { task: n });
+      writeState(missionDir, "parent", { task: n });
 
       // --- parent: write the task brief -----------------------------------
       let parentSaid = "";
+      let taskPromptText = render(cfg.taskPrompt, v);
+      if (inboxEntries.length > 0) {
+        taskPromptText +=
+          "\n\nNEW INBOX ENTRIES (drained just now — route them before writing TASK.md):\n" +
+          inboxEntries.join("\n\n---\n\n") +
+          "\n\nRouting: durable knowledge → STATE.md; direction/constraints → MISSION.md " +
+          "(as parent you may edit it); next-step context → TASK.md.";
+      }
       try {
         parentSaid = await parent.prompt(
-          render(cfg.taskPrompt, v),
+          taskPromptText,
           cfg.parentTimeoutSec * 1000,
         );
       } catch (e) {
@@ -640,6 +942,7 @@ async function cmdRun(missionDir, opts) {
       }
       if (/^\s*STOP\b/i.test(parentSaid)) {
         logLine(missionDir, `task ${n}: parent stopped the loop: ${parentSaid.slice(0, 200)}`, verbose);
+        event(missionDir, "parent_stop", { task: n, reason: parentSaid.trim().slice(0, 200) });
         stopReason = `parent: ${parentSaid.trim().slice(0, 200)}`;
         break;
       }
@@ -650,11 +953,23 @@ async function cmdRun(missionDir, opts) {
         break;
       }
 
+      // --- execution-time gate: TASK.md header, else driver.json wait -------
+      if (!waited) {
+        const taskSpec = execSpecFromText(readFileSync(taskFile, "utf8"));
+        if (taskSpec) {
+          await awaitSpec(missionDir, taskSpec, "TASK.md", verbose);
+        } else {
+          const cfgSpec = cfgWaitSpec(cfg);
+          if (cfgSpec) await awaitSpec(missionDir, cfgSpec, "driver.json wait", verbose);
+        }
+      }
+
       // --- attempt loop: worker → verify → review ---------------------------
       const workerTimeoutMs = cfg.workerTimeoutSec * 1000;
       let taskOk = false;
       let failure = "";
       for (let attempt = 0; attempt <= cfg.maxRetries && !taskOk; attempt++) {
+        failure = ""; // per-attempt: a passing retry must not inherit the old failure
         // -- worker -----------------------------------------------------------
         const worker = new RpcSession({
           name: `plainloop-task-${String(n).padStart(4, "0")}-${missionName}`,
@@ -664,21 +979,35 @@ async function cmdRun(missionDir, opts) {
         });
         const wStart = Date.now();
         let workerSettled = false;
+        writeState(missionDir, "worker", { task: n, attempt: attempt + 1 });
         try {
           await worker.waitForReady();
-          await worker.prompt(render(cfg.workerPrompt, v), workerTimeoutMs);
+          if (cfg.steerOnInbox) {
+            await workerPromptWatchingInbox(
+              worker,
+              missionDir,
+              cfg,
+              render(cfg.workerPrompt, v),
+              workerTimeoutMs,
+              verbose,
+            );
+          } else {
+            await worker.prompt(render(cfg.workerPrompt, v), workerTimeoutMs);
+          }
           workerSettled = true;
           logLine(
             missionDir,
             `task ${n}: worker settled in ${((Date.now() - wStart) / 1000).toFixed(1)}s`,
             verbose,
           );
+          event(missionDir, "worker_settled", { task: n, attempt: attempt + 1, ms: Date.now() - wStart });
         } catch (e) {
           logLine(
             missionDir,
             `task ${n}: worker ${e.message} — steering …`,
             verbose,
           );
+          event(missionDir, "worker_timeout", { task: n, attempt: attempt + 1, error: e.message });
           // steer once, wait for settle within the grace period
           try {
             await worker.sendOk(
@@ -705,8 +1034,10 @@ async function cmdRun(missionDir, opts) {
         if (workerSettled && cfg.verify) {
           if (sh(render(cfg.verify, v), missionDir)) {
             logLine(missionDir, `task ${n}: verify OK`, verbose);
+            event(missionDir, "verify_ok", { task: n, attempt: attempt + 1 });
           } else {
             logLine(missionDir, `task ${n}: verify FAILED (attempt ${attempt + 1})`, verbose);
+            event(missionDir, "verify_fail", { task: n, attempt: attempt + 1 });
             failure = "verify command failed";
           }
         }
@@ -721,6 +1052,7 @@ async function cmdRun(missionDir, opts) {
             excludeTools: ["bash", "edit", "write"],
           });
           let verdict = "";
+          writeState(missionDir, "review", { task: n, attempt: attempt + 1 });
           try {
             await reviewer.waitForReady();
             verdict = await reviewer.prompt(
@@ -742,9 +1074,11 @@ async function cmdRun(missionDir, opts) {
               `task ${n}: reviewer REJECTED (attempt ${attempt + 1}): ${verdict.trim().slice(0, 200)}`,
               verbose,
             );
+            event(missionDir, "review_reject", { task: n, attempt: attempt + 1, reason: verdict.trim().slice(0, 200) });
             failure = `reviewer rejected: ${verdict.trim().slice(0, 200)}`;
           } else if (verdict) {
             logLine(missionDir, `task ${n}: reviewer APPROVED`, verbose);
+            event(missionDir, "review_approve", { task: n, attempt: attempt + 1 });
           }
         }
 
@@ -788,6 +1122,8 @@ async function cmdRun(missionDir, opts) {
       const archiveName = `TASK-${String(n).padStart(4, "0")}.md`;
       renameSync(path.join(missionDir, "TASK.md"), path.join(missionDir, "history", archiveName));
       logLine(missionDir, `task ${n}: archived history/${archiveName}`, verbose);
+      event(missionDir, "archived", { task: n, file: archiveName });
+      writeState(missionDir, "archived", { task: n });
 
       iterations++;
 
@@ -808,10 +1144,12 @@ async function cmdRun(missionDir, opts) {
     }
 
     logLine(missionDir, `run finished: ${stopReason} (${iterations} iterations, ${((Date.now() - t0) / 1000).toFixed(0)}s)`, verbose);
+    event(missionDir, "run_end", { reason: stopReason, iterations });
     console.log(`\ndriver: ${stopReason} — ${iterations} iteration(s) this run`);
     return stopReason === "completed" || stopReason.startsWith("exit") ? 0 : 1;
   } finally {
     clearPid();
+    clearState();
     parent.kill();
   }
 }

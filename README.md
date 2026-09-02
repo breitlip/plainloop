@@ -21,6 +21,84 @@ plainloop/driver.mjs (no LLM context)
 All sessions are normal pi sessions — visible in pi-web and in
 `~/.pi/agent/sessions/`.
 
+## Inbox, scheduled execution, event log
+
+### Flow
+
+```mermaid
+flowchart TD
+    START([driver run]) --> EXIT{exit command<br/>succeeds?}
+    EXIT -- yes --> DONE([stop: mission done])
+    EXIT -- no --> INBOX{INBOX.md has<br/>new entries?}
+    INBOX -- yes --> DRAIN["drain entries into context<br/>(timestamped, logged to events.jsonl)"]
+    INBOX -- no --> SCHED
+    DRAIN --> SCHED{execution time<br/>reached?}
+    SCHED -- "no: future Execute at/when header" --> WAIT["poll condition /<br/>sleep until time (logged)"]
+    WAIT --> SCHED
+    SCHED -- "yes (absent = immediate)" --> PARENT["parent writes TASK.md"]
+    PARENT --> PREPLY{parent reply}
+    PREPLY -- "STOP <reason>" --> STOPPED([stop: parent reason])
+    PREPLY -- READY --> WORKER["worker executes TASK.md"]
+    WORKER --> HOT{inbox changed while<br/>worker runs?}
+    HOT -- "yes + steerOnInbox" --> STEER["steer running worker<br/>with new entry"]
+    STEER --> WORKER
+    HOT -- "no / cold path" --> VERIFY{verify command<br/>passes?}
+    VERIFY -- no --> RETRYQ{retries left?}
+    VERIFY -- yes --> REVIEW{reviewer<br/>APPROVE?}
+    REVIEW -- "REJECT <reason>" --> RETRYQ
+    REVIEW -- APPROVE --> ARCHIVE["archive to history/TASK-NNNN.md<br/>stamp events.jsonl"]
+    RETRYQ -- yes --> CORRECT["parent writes corrective TASK.md"]
+    CORRECT --> PARENT
+    RETRYQ -- no --> FAIL([stop: retries exhausted])
+    ARCHIVE --> COMPACT{every N tasks?}
+    COMPACT -- yes --> C[compact parent session]
+    C --> EXIT
+    COMPACT -- no --> EXIT
+```
+
+### Execution-time headers
+
+`TASK.md` and `INBOX.md` entries accept an optional execution-time header.
+**Absent = immediate** — the default when no header is present.
+
+```text
+Execute at: 2026-03-01T09:00:00+01:00                    # fixed time (ISO-8601)
+Execute when: test -f done.flag && grep -q ok ci.log      # polled shell condition
+```
+
+The driver parks the loop (logged to `events.jsonl`) until the time is
+reached or the condition succeeds, then continues. Precedence when several
+sources declare a time: **inbox entry header → TASK.md header → `driver.json`
+`wait` → immediate**.
+
+### INBOX.md entry format
+
+Writers append at any time — no timing required. Each entry is a block:
+
+```markdown
+## [2026-02-01T14:03:00+01:00] add tax rule
+Execute at: 2026-03-01T09:00:00+01:00   # optional, absent = immediate
+priority: steer                         # optional: steer | stop (hot path)
+
+Body: what to add and where it belongs…
+```
+
+- **Cold path (default):** the driver drains new entries at the iteration
+  boundary (after archive, before the next parent prompt) and folds them into
+  the next TASK.md context.
+- **Hot path (opt-in, `steerOnInbox: true`):** while the worker runs, a new
+  entry triggers an RPC `steer` of the live worker session; `priority: stop`
+  aborts instead.
+- The driver records the last-drained timestamp so restarts never double-drain.
+
+### Event log
+
+`events.jsonl` in the mission dir: one `{ts, event, detail}` line per driver
+action — task start/end, worker spawn/settle/timeout/retry, verify, review,
+compact, inbox drain, wait begin/end. Append-only, machine-readable; gives
+crash recovery, timing analysis, and an audit trail. `status` renders the
+last N events.
+
 ## Install
 
 The package is a standard pi package (extension + skill), so install it from
@@ -59,9 +137,10 @@ The package ships a pi extension, so in any pi session (TUI, RPC, pi-web):
 /plainloop help
 ```
 
-`status` answers "is it actually running?" — driver pid liveness, last log
-activity, the last `driver.log` lines, plus a work summary (latest completed
-task, CURRENT.md, STATE.md).
+`status` answers "is it actually running?" — driver pid liveness, the
+current phase (`run — worker (task 3)` or `wait until … (remaining hh:mm:ss)`),
+the last `driver.log` lines, the last `events.jsonl` events, plus a work
+summary (latest completed task, CURRENT.md, STATE.md).
 
 `list` shows every plainloop session for the mission (parent, task-NNNN,
 review-NNNN) with last activity and size — they live in pi-web under the
@@ -102,8 +181,11 @@ Flags:
 ├── STATE.md      durable state (sessions update per TASK.md)
 ├── TASK.md       current task brief (parent writes, worker executes)
 ├── CURRENT.md    worker scratch
+├── INBOX.md      optional drop-in entries, drained by the driver each iteration
 ├── history/      completed briefs: TASK-0001.md, TASK-0002.md, ...
 ├── driver.json   driver contract (all keys optional)
+├── events.jsonl  append-only timestamped driver event log
+├── .plainloop.state.json  current phase (run/wait), cleared when the run ends
 ├── driver.log    append-only driver activity log
 └── driver.err.log driver stderr (crash diagnostics) when started via the extension
 ```
@@ -118,6 +200,7 @@ Flags:
 | `review` | `true` | Run an independent read-only reviewer session (APPROVE/REJECT) after verify, before archiving. Set `false` for cheap high-volume missions |
 | `reviewTimeoutSec` | `120` | Reviewer run timeout |
 | `exit` | `null` | Shell command (run in mission dir); success = mission done, loop stops |
+| `wait` | `null` | Execution gate per iteration: `{"at":"2026-03-01T09:00:00+01:00"}` or `{"command":"test -f done.flag","intervalMs":30000,"timeoutMs":0}` (`timeoutMs` 0 = wait forever). Lower precedence than `Execute at/when` headers in INBOX.md entries or TASK.md |
 | `countPattern` | `null` | Regex with one capture group, matched in STATE.md to derive `{{count}}` |
 | `sessionCwd` | git root | cwd for the spawned pi sessions (pi keys sessions by cwd — defaulting to the repo root keeps them visible under the project in pi-web). Mission dir if no git root |
 | `compactEvery` | `5` | Compact the parent session after every N completed tasks |
@@ -126,6 +209,8 @@ Flags:
 | `workerTimeoutSec` | `240` | Worker run timeout before the driver steers it |
 | `steerGraceSec` | `60` | Grace period after steering before aborting |
 | `maxRetries` | `1` | Worker retries per task (each retry gets a parent-written corrective TASK.md) |
+| `steerOnInbox` | `false` | Hot path: new INBOX.md entries while the worker runs steer the live worker session (`priority: stop` in an entry aborts it) |
+| `inboxPollMs` | `5000` | Inbox poll interval while the worker runs (only used with `steerOnInbox`) |
 
 ## Failure handling
 
