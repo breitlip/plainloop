@@ -35,6 +35,7 @@ flowchart TD
     DRAIN --> SCHED{execution time<br/>reached?}
     SCHED -- "no: future Execute at/when header" --> WAIT["poll condition /<br/>sleep until time (logged)"]
     WAIT --> SCHED
+    WAIT -- "new INBOX.md entry<br/>(interrupts the wait)" --> DRAIN
     SCHED -- "yes (absent = immediate)" --> PARENT["parent writes TASK.md"]
     PARENT --> PREPLY{parent reply}
     PREPLY -- "STOP <reason>" --> STOPPED([stop: parent reason])
@@ -71,6 +72,11 @@ reached or the condition succeeds, then continues. Precedence when several
 sources declare a time: **inbox entry header → TASK.md header → `driver.json`
 `wait` → immediate**.
 
+**The inbox is the interrupt door:** a new `INBOX.md` entry appended while
+the driver waits ends the wait immediately (checked every second, logged as
+`wait_interrupted`). The fresh entry is drained and routed to the parent on
+the next round — the inbox always wins over the schedule.
+
 ### INBOX.md entry format
 
 Writers append at any time — no timing required. Each entry is a block:
@@ -89,13 +95,16 @@ Body: what to add and where it belongs…
 - **Hot path (opt-in, `steerOnInbox: true`):** while the worker runs, a new
   entry triggers an RPC `steer` of the live worker session; `priority: stop`
   aborts instead.
+- **Wait interrupt (default):** a new entry while the driver is parked in a
+  wait ends the wait immediately; the entry is drained and routed to the
+  parent on the next round.
 - The driver records the last-drained timestamp so restarts never double-drain.
 
 ### Event log
 
 `events.jsonl` in the mission dir: one `{ts, event, detail}` line per driver
 action — task start/end, worker spawn/settle/timeout/retry, verify, review,
-compact, inbox drain, wait begin/end. Append-only, machine-readable; gives
+compact, inbox drain, wait begin/end/interrupt. Append-only, machine-readable; gives
 crash recovery, timing analysis, and an audit trail. `status` renders the
 last N events.
 

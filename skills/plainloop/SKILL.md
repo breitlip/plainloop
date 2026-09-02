@@ -212,11 +212,16 @@ Reference implementation flow per task:
   `Execute at: <ISO-8601>` or `Execute when: <shell condition>`; **absent =
   immediate**. The driver parks the loop (logged) until the time is reached or
   the condition succeeds.
+- **Wait interrupt (default)** — a new inbox entry while the driver is parked
+  in a wait ends the wait immediately (`wait_interrupted` in events.jsonl);
+  the entry is drained and routed to the parent on the next round. The inbox
+  always wins over the schedule.
 - **Hot path (opt-in, `steerOnInbox`)** — new inbox entries while the worker
   runs steer the live worker session; `priority: stop` in an entry aborts it.
 - **events.jsonl** — append-only `{ts, event, detail}` log of every driver
   action (task start, worker settle/timeout, verify, review, archive, inbox
-  drain, wait begin/end). `status` renders the last events and the current
+  drain, wait begin/end/interrupt). `status` renders the last events and the
+  current
   phase: `run — worker (task 3)` or `wait until … (remaining hh:mm:ss)`.
 
 ## Relay driver (pi-web)

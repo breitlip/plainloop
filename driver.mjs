@@ -365,6 +365,22 @@ function newInboxEntries(missionDir) {
   return fresh;
 }
 
+/** True if INBOX.md has entries appended since the last drain (read-only peek — does not advance the cursor). */
+function hasFreshInboxEntries(missionDir) {
+  const file = path.join(missionDir, "INBOX.md");
+  if (!existsSync(file)) return false;
+  const entries = parseInbox(readFileSync(file, "utf8"));
+  const stateFile = path.join(missionDir, ".plainloop.inbox.json");
+  let state = { mtimeMs: 0, drainedCount: 0 };
+  try {
+    state = JSON.parse(readFileSync(stateFile, "utf8"));
+  } catch {
+    /* first drain */
+  }
+  if (entries.length < state.drainedCount) return true; // rewritten file — treat as fresh
+  return entries.length > state.drainedCount;
+}
+
 // ---------------------------------------------------------------------------
 // execution-time gates (Execute at: / Execute when: headers)
 // ---------------------------------------------------------------------------
@@ -401,6 +417,8 @@ function cfgWaitSpec(cfg) {
 /**
  * Park the loop until the spec is satisfied. Sleeps in 1s chunks so SIGTERM
  * stays responsive; `when` polls a shell condition (timeoutMs 0 = wait forever).
+ * New INBOX.md entries interrupt the wait (returns "interrupted") — the inbox
+ * is the interrupt door; the caller re-drains and routes the fresh entries.
  */
 async function awaitSpec(missionDir, spec, label, verbose) {
   if (!spec) return;
@@ -415,6 +433,11 @@ async function awaitSpec(missionDir, spec, label, verbose) {
     );
     event(missionDir, "wait_start", { label, kind: "at", until: new Date(spec.value).toISOString() });
     while (delay > 0) {
+      if (hasFreshInboxEntries(missionDir)) {
+        logLine(missionDir, `wait (${label}): interrupted by new INBOX.md entries`, verbose);
+        event(missionDir, "wait_interrupted", { label, kind: "at" });
+        return "interrupted";
+      }
       await new Promise((r) => setTimeout(r, Math.min(delay, 1000)));
       delay = spec.value - Date.now();
     }
@@ -430,6 +453,11 @@ async function awaitSpec(missionDir, spec, label, verbose) {
   event(missionDir, "wait_start", { label, kind: "when", command: spec.command });
   for (;;) {
     if (sh(spec.command, missionDir)) break;
+    if (hasFreshInboxEntries(missionDir)) {
+      logLine(missionDir, `wait (${label}): interrupted by new INBOX.md entries`, verbose);
+      event(missionDir, "wait_interrupted", { label, kind: "when" });
+      return "interrupted";
+    }
     if (timeoutMs > 0 && Date.now() - started > timeoutMs) {
       logLine(missionDir, `wait (${label}): timeout — continuing anyway`, verbose);
       event(missionDir, "wait_timeout", { label, kind: "when" });
@@ -911,8 +939,20 @@ async function cmdRun(missionDir, opts) {
         event(missionDir, "inbox_drain", { task: n, entries: inboxEntries.length });
         const inboxSpec = inboxEntries.map(execSpecFromText).find(Boolean) ?? null;
         if (inboxSpec) {
-          await awaitSpec(missionDir, inboxSpec, "inbox", verbose);
+          const r = await awaitSpec(missionDir, inboxSpec, "inbox", verbose);
           waited = true;
+          if (r === "interrupted") {
+            const more = newInboxEntries(missionDir);
+            if (more.length > 0) {
+              logLine(
+                missionDir,
+                `task ${n}: wait interrupted — ${more.length} more inbox entr${more.length === 1 ? "y" : "ies"} drained`,
+                verbose,
+              );
+              event(missionDir, "inbox_drain", { task: n, entries: more.length, interrupted: true });
+              inboxEntries.push(...more);
+            }
+          }
         }
       }
 
@@ -954,13 +994,15 @@ async function cmdRun(missionDir, opts) {
       }
 
       // --- execution-time gate: TASK.md header, else driver.json wait -------
+      // A new INBOX.md entry interrupts the wait; the loop restarts so the
+      // cold path drains it and the parent routes it (inbox wins over schedule).
       if (!waited) {
         const taskSpec = execSpecFromText(readFileSync(taskFile, "utf8"));
         if (taskSpec) {
-          await awaitSpec(missionDir, taskSpec, "TASK.md", verbose);
+          if ((await awaitSpec(missionDir, taskSpec, "TASK.md", verbose)) === "interrupted") continue;
         } else {
           const cfgSpec = cfgWaitSpec(cfg);
-          if (cfgSpec) await awaitSpec(missionDir, cfgSpec, "driver.json wait", verbose);
+          if (cfgSpec && (await awaitSpec(missionDir, cfgSpec, "driver.json wait", verbose)) === "interrupted") continue;
         }
       }
 
