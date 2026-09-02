@@ -849,7 +849,7 @@ try {
     cmdStatus(path.resolve(args[0]), loadDriverConfig(path.resolve(args[0])));
   } else if (cmd === "list" && args[0]) {
     cmdList(path.resolve(args[0]), loadDriverConfig(path.resolve(args[0])));
-  } else if (cmd === "run" && args[0]) {
+  } else if ((cmd === "run" || cmd === "start") && args[0]) {
     const missionDir = path.resolve(args[0]);
     const code = await cmdRun(missionDir, {
       max: flagValue("--max", undefined) !== undefined
@@ -862,7 +862,7 @@ try {
   } else {
     console.log(
       "usage:\n" +
-        "  node driver.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]\n" +
+        "  node driver.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]   (alias: start)\n" +
         "  node driver.mjs status <mission-dir>\n" +
         "  node driver.mjs list <mission-dir>",
     );

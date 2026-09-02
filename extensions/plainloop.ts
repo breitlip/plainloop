@@ -3,7 +3,7 @@
  * from inside pi (TUI, RPC, pi-web).
  *
  *   /plainloop status <mission>           show mission status (mission required)
- *   /plainloop run <mission> [--max N] [--dry-run]
+ *   /plainloop run <mission> [--max N] [--dry-run]   (alias: start)
  *   /plainloop stop [mission]              stop a running mission
  *   /plainloop help
  *
@@ -205,7 +205,8 @@ export default function plainloop(pi: ExtensionAPI) {
         else if (parts[i] === "--dry-run") flags.dryRun = "1";
         else positional.push(parts[i]);
       }
-      const [action = "status", missionArg] = positional;
+      const [actionRaw = "status", missionArg] = positional;
+      const action = actionRaw === "start" ? "run" : actionRaw;
 
       const notify = (text: string, kind: "info" | "error" | "warning" = "info") => {
         try {
@@ -219,7 +220,7 @@ export default function plainloop(pi: ExtensionAPI) {
         notify(
           [
             "/plainloop status <mission> — mission required; shows liveness, last activity, and a work summary",
-            "/plainloop run <mission> [--max N] [--dry-run] — start a background run",
+            "/plainloop run <mission> [--max N] [--dry-run] — start a background run (alias: start)",
             "/plainloop stop [mission] — stop a running mission",
             "/plainloop list — list the missions under ./missions/ with their status",
             "/plainloop list <mission> — list the mission's pi sessions (to open in pi-web)",
@@ -287,7 +288,7 @@ export default function plainloop(pi: ExtensionAPI) {
     description:
       "Drive a plainloop mission (a directory with MISSION.md, STATE.md, TASK.md, history/). " +
       "Actions: 'status' shows progress, liveness, and a work summary (mission " +
-      "required); 'run' starts a " +
+      "required); 'run' (alias: 'start') starts a " +
       "background driver run (optionally capped with max iterations) and returns immediately; " +
       "'stop' terminates a running mission; 'list' lists the missions under ./missions/ with " +
       "their status ([running] or [idle]) and relative paths when no mission is given, " +
@@ -298,7 +299,8 @@ export default function plainloop(pi: ExtensionAPI) {
     parameters: Type.Object({
       action: Type.Union(
         [
-          Type.Literal("run"),
+          Type.Literal("run", { description: "Start a background driver run" }),
+          Type.Literal("start", { description: "Alias for 'run'" }),
           Type.Literal("status"),
           Type.Literal("stop"),
           Type.Literal("list"),
@@ -328,20 +330,22 @@ export default function plainloop(pi: ExtensionAPI) {
         }
       };
 
-      if (params.action === "version") {
+      const act = params.action === "start" ? "run" : params.action;
+
+      if (act === "version") {
         const text = versionInfo();
         notify(text, "info");
         return { content: [{ type: "text", text }], details: { ok: true } };
       }
 
-      if (params.action === "list" && !params.mission) {
+      if (act === "list" && !params.mission) {
         const r = listMissions(ctx.cwd);
         const text = r.ok ? r.lines.join("\n") : r.error;
         notify(text, r.ok ? "info" : "error");
         return { content: [{ type: "text", text }], details: { ok: r.ok } };
       }
 
-      if (params.action === "status" && !params.mission) {
+      if (act === "status" && !params.mission) {
         const r = listMissions(ctx.cwd);
         const text = `status requires a mission argument${r.ok ? `\n${r.lines.join("\n")}` : ""}`;
         notify(text, "error");
@@ -358,11 +362,11 @@ export default function plainloop(pi: ExtensionAPI) {
 
       let text: string;
       let ok = true;
-      if (params.action === "status") {
+      if (act === "status") {
         text = runStatus(mission);
-      } else if (params.action === "list") {
+      } else if (act === "list") {
         text = runList(mission);
-      } else if (params.action === "run") {
+      } else if (act === "run") {
         const r = startRun(mission, { max: params.max, dryRun: params.dryRun }, notify, ctx.cwd);
         text = r.text;
         ok = r.ok;
