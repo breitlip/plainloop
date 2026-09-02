@@ -2,7 +2,7 @@
  * plainloop extension — slash command + tool for driving plainloop missions
  * from inside pi (TUI, RPC, pi-web).
  *
- *   /plainloop status [mission]            show mission status
+ *   /plainloop status <mission>           show mission status (mission required)
  *   /plainloop run <mission> [--max N] [--dry-run]
  *   /plainloop stop [mission]              stop a running mission
  *   /plainloop help
@@ -51,6 +51,24 @@ export default function plainloop(pi: ExtensionAPI) {
     | { ok: true; mission: string }
     | { ok: false; error: string; list?: string[] };
 
+  function missionLine(mission: string, cwd: string): string {
+    const rel = path.relative(cwd, mission);
+    const pid = livePid(mission);
+    return `${rel || mission}${pid ? " [running]" : " [idle]"}`;
+  }
+
+  function listMissions(
+    cwd: string,
+  ): { ok: true; lines: string[] } | { ok: false; error: string } {
+    const root = path.join(cwd, "missions");
+    if (!existsSync(root)) return { ok: false, error: `no ./missions/ directory in ${cwd}` };
+    const missions = readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && existsSync(path.join(root, e.name, "MISSION.md")))
+      .map((e) => path.join(root, e.name));
+    if (missions.length === 0) return { ok: false, error: `no missions (with MISSION.md) in ${root}` };
+    return { ok: true, lines: missions.map((m) => missionLine(m, cwd)) };
+  }
+
   function resolveMission(arg: string | undefined, cwd: string): MissionResolution {
     if (arg) {
       const m = path.resolve(cwd, arg);
@@ -60,12 +78,16 @@ export default function plainloop(pi: ExtensionAPI) {
     const root = path.join(cwd, "missions");
     if (!existsSync(root))
       return { ok: false, error: "no mission given and no ./missions/ directory here" };
-    const list = readdirSync(root, { withFileTypes: true })
+    const missions = readdirSync(root, { withFileTypes: true })
       .filter((e) => e.isDirectory() && existsSync(path.join(root, e.name, "MISSION.md")))
       .map((e) => path.join(root, e.name));
-    if (list.length === 0) return { ok: false, error: `no missions (with MISSION.md) in ${root}` };
-    if (list.length === 1) return { ok: true, mission: list[0] };
-    return { ok: false, error: "multiple missions found — pass one explicitly", list };
+    if (missions.length === 0) return { ok: false, error: `no missions (with MISSION.md) in ${root}` };
+    if (missions.length === 1) return { ok: true, mission: missions[0] };
+    return {
+      ok: false,
+      error: "multiple missions found — pass one explicitly",
+      list: missions.map((m) => missionLine(m, cwd)),
+    };
   }
 
   function runStatus(mission: string): string {
@@ -196,10 +218,11 @@ export default function plainloop(pi: ExtensionAPI) {
       if (action === "help") {
         notify(
           [
-            "/plainloop status [mission] — show status, liveness, and a work summary",
+            "/plainloop status <mission> — mission required; shows liveness, last activity, and a work summary",
             "/plainloop run <mission> [--max N] [--dry-run] — start a background run",
             "/plainloop stop [mission] — stop a running mission",
-            "/plainloop list [mission] — list the mission's pi sessions (to open in pi-web)",
+            "/plainloop list — list the missions under ./missions/ with their status",
+            "/plainloop list <mission> — list the mission's pi sessions (to open in pi-web)",
             "/plainloop version — show the installed extension version",
           ].join("\n"),
           "info",
@@ -209,6 +232,21 @@ export default function plainloop(pi: ExtensionAPI) {
 
       if (action === "version") {
         notify(versionInfo(), "info");
+        return;
+      }
+
+      if (action === "list" && !missionArg) {
+        const r = listMissions(ctx.cwd);
+        notify(r.ok ? r.lines.join("\n") : r.error, r.ok ? "info" : "error");
+        return;
+      }
+
+      if (action === "status" && !missionArg) {
+        const r = listMissions(ctx.cwd);
+        notify(
+          `status requires a mission argument${r.ok ? `\n${r.lines.join("\n")}` : ""}`,
+          "error",
+        );
         return;
       }
 
@@ -248,12 +286,15 @@ export default function plainloop(pi: ExtensionAPI) {
     label: "Plainloop",
     description:
       "Drive a plainloop mission (a directory with MISSION.md, STATE.md, TASK.md, history/). " +
-      "Actions: 'status' shows progress, liveness, and a work summary; 'run' starts a " +
+      "Actions: 'status' shows progress, liveness, and a work summary (mission " +
+      "required); 'run' starts a " +
       "background driver run (optionally capped with max iterations) and returns immediately; " +
-      "'stop' terminates a running mission; 'list' lists the mission's pi sessions (parent, " +
-      "task-NNNN, review-NNNN) so they can be opened in pi-web; 'version' reports the installed " +
-      "extension version. " +
-      "Omit mission to auto-detect the single mission under ./missions/.",
+      "'stop' terminates a running mission; 'list' lists the missions under ./missions/ with " +
+      "their status ([running] or [idle]) and relative paths when no mission is given, " +
+      "or the mission's pi sessions (parent, task-NNNN, review-NNNN) when a mission is given so " +
+      "they can be opened in pi-web; 'version' reports the installed extension version. " +
+      "Omit mission to auto-detect the single mission under ./missions/ (for run/stop; " +
+      "status requires a mission).",
     parameters: Type.Object({
       action: Type.Union(
         [
@@ -291,6 +332,20 @@ export default function plainloop(pi: ExtensionAPI) {
         const text = versionInfo();
         notify(text, "info");
         return { content: [{ type: "text", text }], details: { ok: true } };
+      }
+
+      if (params.action === "list" && !params.mission) {
+        const r = listMissions(ctx.cwd);
+        const text = r.ok ? r.lines.join("\n") : r.error;
+        notify(text, r.ok ? "info" : "error");
+        return { content: [{ type: "text", text }], details: { ok: r.ok } };
+      }
+
+      if (params.action === "status" && !params.mission) {
+        const r = listMissions(ctx.cwd);
+        const text = `status requires a mission argument${r.ok ? `\n${r.lines.join("\n")}` : ""}`;
+        notify(text, "error");
+        return { content: [{ type: "text", text }], details: { ok: false } };
       }
 
       const res = resolveMission(params.mission, ctx.cwd);
