@@ -137,6 +137,10 @@ The package ships a pi extension, so in any pi session (TUI, RPC, pi-web):
 /plainloop help
 ```
 
+`mission` can be a name (`missions/foo`), a path, or a number from
+`/plainloop list` (1..n, in list order) — e.g. `status 2` instead of
+`status missions/another-id`. The longer forms keep working.
+
 `status` answers "is it actually running?" — driver pid liveness, the
 current phase (`run — worker (task 3)` or `wait until … (remaining hh:mm:ss)`),
 the last `driver.log` lines, the last `events.jsonl` events, plus a work

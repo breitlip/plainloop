@@ -51,42 +51,65 @@ export default function plainloop(pi: ExtensionAPI) {
     | { ok: true; mission: string }
     | { ok: false; error: string; list?: string[] };
 
-  function missionLine(mission: string, cwd: string): string {
+  function missionLine(mission: string, cwd: string, index?: number): string {
     const rel = path.relative(cwd, mission);
     const pid = livePid(mission);
-    return `${rel || mission}${pid ? " [running]" : " [idle]"}`;
+    return `${index ? `${index}: ` : ""}${rel || mission}${pid ? " [running]" : " [idle]"}`;
+  }
+
+  /** All missions under ./missions/, sorted by name — the source of the 1..n aliases. */
+  function findMissions(cwd: string): string[] {
+    const root = path.join(cwd, "missions");
+    if (!existsSync(root)) return [];
+    return readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && existsSync(path.join(root, e.name, "MISSION.md")))
+      .map((e) => path.join(root, e.name))
+      .sort((a, b) => a.localeCompare(b));
   }
 
   function listMissions(
     cwd: string,
   ): { ok: true; lines: string[] } | { ok: false; error: string } {
-    const root = path.join(cwd, "missions");
-    if (!existsSync(root)) return { ok: false, error: `no ./missions/ directory in ${cwd}` };
-    const missions = readdirSync(root, { withFileTypes: true })
-      .filter((e) => e.isDirectory() && existsSync(path.join(root, e.name, "MISSION.md")))
-      .map((e) => path.join(root, e.name));
-    if (missions.length === 0) return { ok: false, error: `no missions (with MISSION.md) in ${root}` };
-    return { ok: true, lines: missions.map((m) => missionLine(m, cwd)) };
+    const missions = findMissions(cwd);
+    if (missions.length === 0)
+      return { ok: false, error: `no missions (with MISSION.md) in ${path.join(cwd, "missions")}` };
+    return { ok: true, lines: missions.map((m, i) => missionLine(m, cwd, i + 1)) };
   }
 
   function resolveMission(arg: string | undefined, cwd: string): MissionResolution {
     if (arg) {
+      // numeric alias: 1..n over the sorted ./missions/ list (see `list`)
+      if (/^\d+$/.test(arg.trim())) {
+        const missions = findMissions(cwd);
+        const i = Number(arg) - 1;
+        if (i >= 0 && i < missions.length) return { ok: true, mission: missions[i] };
+        return {
+          ok: false,
+          error:
+            missions.length === 0
+              ? `no mission ${arg} (no missions under ${path.join(cwd, "missions")})`
+              : `no mission ${arg} — valid numbers: 1..${missions.length}`,
+          list: missions.map((m, j) => missionLine(m, cwd, j + 1)),
+        };
+      }
       const m = path.resolve(cwd, arg);
       if (existsSync(path.join(m, "MISSION.md"))) return { ok: true, mission: m };
+      // bare mission name under ./missions/
+      const underRoot = path.join(cwd, "missions", arg);
+      if (existsSync(path.join(underRoot, "MISSION.md"))) return { ok: true, mission: underRoot };
       return { ok: false, error: `no MISSION.md in ${m}` };
     }
     const root = path.join(cwd, "missions");
     if (!existsSync(root))
       return { ok: false, error: "no mission given and no ./missions/ directory here" };
-    const missions = readdirSync(root, { withFileTypes: true })
-      .filter((e) => e.isDirectory() && existsSync(path.join(root, e.name, "MISSION.md")))
-      .map((e) => path.join(root, e.name));
-    if (missions.length === 0) return { ok: false, error: `no missions (with MISSION.md) in ${root}` };
+    const missions = findMissions(cwd);
+    if (missions.length === 0)
+      return { ok: false, error: `no missions (with MISSION.md) in ${root}` };
     if (missions.length === 1) return { ok: true, mission: missions[0] };
     return {
       ok: false,
-      error: "multiple missions found — pass one explicitly",
-      list: missions.map((m) => missionLine(m, cwd)),
+      error: "multiple missions found — pass one explicitly (name, path, or number from `list`)",
+      list: missions.map((m, i) => missionLine(m, cwd, i + 1)),
     };
   }
 
@@ -168,7 +191,11 @@ export default function plainloop(pi: ExtensionAPI) {
     });
     return {
       ok: true,
-      text: `started (pid ${pid}) — log: ${path.join(mission, "driver.log")}; stop with /plainloop stop ${mission}`,
+      text: (() => {
+        const idx = findMissions(cwd).indexOf(mission);
+        const ref = idx >= 0 ? String(idx + 1) : mission;
+        return `started (pid ${pid}) — log: ${path.join(mission, "driver.log")}; stop with /plainloop stop ${ref}`;
+      })(),
     };
   }
 
@@ -219,12 +246,13 @@ export default function plainloop(pi: ExtensionAPI) {
       if (action === "help") {
         notify(
           [
-            "/plainloop status <mission> — mission required; shows liveness, last activity, and a work summary",
+            "/plainloop status <mission> — mission required (name, path, or number from `list`); shows liveness, last activity, and a work summary",
             "/plainloop run <mission> [--max N] [--dry-run] — start a background run (alias: start)",
             "/plainloop stop [mission] — stop a running mission",
-            "/plainloop list — list the missions under ./missions/ with their status",
+            "/plainloop list — list the missions under ./missions/ with their status (numbered 1..n)",
             "/plainloop list <mission> — list the mission's pi sessions (to open in pi-web)",
             "/plainloop version — show the installed extension version",
+            "mission can be a name (missions/foo), a path, or a number from /plainloop list",
           ].join("\n"),
           "info",
         );
@@ -291,11 +319,11 @@ export default function plainloop(pi: ExtensionAPI) {
       "required); 'run' (alias: 'start') starts a " +
       "background driver run (optionally capped with max iterations) and returns immediately; " +
       "'stop' terminates a running mission; 'list' lists the missions under ./missions/ with " +
-      "their status ([running] or [idle]) and relative paths when no mission is given, " +
-      "or the mission's pi sessions (parent, task-NNNN, review-NNNN) when a mission is given so " +
+      "their status ([running] or [idle]) and relative paths when no mission is given (numbered " +
+      "1..n), or the mission's pi sessions (parent, task-NNNN, review-NNNN) when a mission is given so " +
       "they can be opened in pi-web; 'version' reports the installed extension version. " +
       "Omit mission to auto-detect the single mission under ./missions/ (for run/stop; " +
-      "status requires a mission).",
+      "status requires a mission). Mission can be a name, a path, or a number 1..n from 'list'.",
     parameters: Type.Object({
       action: Type.Union(
         [
@@ -311,7 +339,7 @@ export default function plainloop(pi: ExtensionAPI) {
       mission: Type.Optional(
         Type.String({
           description:
-            "Mission directory (absolute or cwd-relative). Omit to auto-detect the single mission under ./missions/.",
+            "Mission directory (absolute or cwd-relative), or a number 1..n from the 'list' action. Omit to auto-detect the single mission under ./missions/.",
         }),
       ),
       max: Type.Optional(
