@@ -222,6 +222,7 @@ Flags:
 | `workerTimeoutSec` | `240` | Worker run timeout before the driver steers it |
 | `steerGraceSec` | `60` | Grace period after steering before aborting |
 | `maxRetries` | `1` | Worker retries per task (each retry gets a parent-written corrective TASK.md) |
+| `parentRetries` | `1` | Retries when the parent settles without writing `TASK.md` and without replying `STOP` (e.g. a thinking-only turn). The driver re-prompts the **same** long-lived parent session with a corrective nudge; an explicit `STOP` reply is never retried. `0` = hard-stop on the first such settle |
 | `steerOnInbox` | `false` | Hot path: new INBOX.md entries while the worker runs steer the live worker session (`priority: stop` in an entry aborts it) |
 | `inboxPollMs` | `5000` | Inbox poll interval while the worker runs (only used with `steerOnInbox`) |
 

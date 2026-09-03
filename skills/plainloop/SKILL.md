@@ -170,7 +170,8 @@ text of a run is readable from `agent_end.messages` — use it for
 The driver keeps the mission contract (MISSION/STATE/TASK/CURRENT/history)
 and adds a `driver.json` with the machine-checkable parts: `verify` and
 `exit` shell commands, `countPattern`, `compactEvery`, worker timeouts,
-retry policy. The reference implementation ships with this package as
+retry policy (worker `maxRetries`, parent `parentRetries`). The reference
+implementation ships with this package as
 `driver.mjs` (see the package README).
 
 Running the driver: it is a plain Node script, no dependencies. `driver.mjs`
@@ -192,7 +193,9 @@ works directly. When in doubt: `find ~/.pi/agent -name driver.mjs -path "*plainl
 
 Reference implementation flow per task:
 
-1. parent: write TASK.md (replies `READY` or `STOP <reason>`)
+1. parent: write TASK.md (replies `READY` or `STOP <reason>`; if it settles
+   with neither, the driver re-prompts the same parent up to `parentRetries`
+   times — a `STOP` reply is final and never retried)
 2. worker: execute TASK.md (steer → abort → retry on timeout)
 3. driver: run `verify` command; on failure → corrective retry
 4. reviewer: independent read-only session replies `APPROVE` or

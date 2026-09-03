@@ -41,6 +41,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 // Windows: `pi` is an extensionless shim; spawn needs `pi.cmd` + shell:true.
 const PI_BIN =
@@ -114,6 +115,7 @@ const DEFAULTS = {
   workerTimeoutSec: 240,
   steerGraceSec: 60,
   maxRetries: 1,
+  parentRetries: 1, // parent settles without TASK.md/STOP → re-prompt same session
   review: true,
   reviewTimeoutSec: 120,
   reviewPrompt:
@@ -129,6 +131,41 @@ function loadDriverConfig(missionDir) {
   let raw = {};
   if (existsSync(file)) raw = JSON.parse(readFileSync(file, "utf8"));
   return { ...DEFAULTS, ...raw };
+}
+
+// ---------------------------------------------------------------------------
+// parent post-settle decision (pure — exported for node --test)
+// ---------------------------------------------------------------------------
+
+const STOP_RE = /^\s*STOP\b/i;
+
+/**
+ * Decide what to do after the parent settles a task prompt.
+ *
+ * @param {string} reply last assistant text of the parent's turn ("" for
+ *   thinking-only turns — e.g. a model that exhausted its output budget)
+ * @param {boolean} taskFileExists whether TASK.md exists in the mission dir
+ * @param {number} attempt 1-based number of the attempt that just settled
+ * @param {number} parentRetries configured retries (0 → single attempt)
+ * @returns {{action:"stop"|"retry"|"proceed", kind:string, reason:string}}
+ *   `stop` — final: an explicit STOP reply (never retried), or no TASK.md
+ *   after the last allowed attempt. `retry` — re-prompt the SAME long-lived
+ *   parent session with a corrective nudge. `proceed` — TASK.md is present.
+ */
+export function decideParentOutcome(reply, taskFileExists, attempt, parentRetries) {
+  const text = String(reply ?? "").trim();
+  if (STOP_RE.test(text)) {
+    return { action: "stop", kind: "stop-reply", reason: `parent: ${text.slice(0, 200)}` };
+  }
+  if (taskFileExists) return { action: "proceed", kind: "task-ready", reason: "" };
+  const totalAttempts = Math.max(1, Math.floor(Number(parentRetries) || 0) + 1);
+  if (attempt < totalAttempts)
+    return { action: "retry", kind: "no-task", reason: "no TASK.md" };
+  return {
+    action: "stop",
+    kind: "no-task",
+    reason: `parent did not write TASK.md after ${totalAttempts} attempt${totalAttempts === 1 ? "" : "s"}`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -970,28 +1007,56 @@ async function cmdRun(missionDir, opts) {
           "\n\nRouting: durable knowledge → STATE.md; direction/constraints → MISSION.md " +
           "(as parent you may edit it); next-step context → TASK.md.";
       }
-      try {
-        parentSaid = await parent.prompt(
-          taskPromptText,
-          cfg.parentTimeoutSec * 1000,
-        );
-      } catch (e) {
-        logLine(missionDir, `task ${n}: parent failed: ${e.message}`, verbose);
-        stopReason = `parent failed: ${e.message}`;
-        break;
-      }
-      if (/^\s*STOP\b/i.test(parentSaid)) {
-        logLine(missionDir, `task ${n}: parent stopped the loop: ${parentSaid.slice(0, 200)}`, verbose);
-        event(missionDir, "parent_stop", { task: n, reason: parentSaid.trim().slice(0, 200) });
-        stopReason = `parent: ${parentSaid.trim().slice(0, 200)}`;
-        break;
-      }
+      // A settle that yields neither STOP nor TASK.md is a model hiccup, not
+      // a direction decision: re-prompt the SAME long-lived parent (it keeps
+      // context) up to cfg.parentRetries times before stopping. A parent
+      // timeout (the throw path) stays a hard stop.
       const taskFile = path.join(missionDir, "TASK.md");
-      if (!existsSync(taskFile)) {
-        logLine(missionDir, `task ${n}: parent did not write TASK.md — stopping`, verbose);
-        stopReason = "parent did not write TASK.md";
-        break;
+      const parentRetries = Math.max(0, Math.floor(Number(cfg.parentRetries) || 0));
+      const parentNudge =
+        "\n\nYour previous turn ended without writing TASK.md and without replying " +
+        "STOP. Do one of the two now: write TASK.md and reply exactly READY, or " +
+        "reply exactly STOP <reason>.";
+      let parentOk = false;
+      for (let attempt = 1; attempt <= parentRetries + 1 && !parentOk; attempt++) {
+        try {
+          parentSaid = await parent.prompt(
+            attempt === 1 ? taskPromptText : taskPromptText + parentNudge,
+            cfg.parentTimeoutSec * 1000,
+          );
+        } catch (e) {
+          logLine(missionDir, `task ${n}: parent failed: ${e.message}`, verbose);
+          stopReason = `parent failed: ${e.message}`;
+          break;
+        }
+        const decision = decideParentOutcome(
+          parentSaid,
+          existsSync(taskFile),
+          attempt,
+          parentRetries,
+        );
+        if (decision.action === "stop") {
+          if (decision.kind === "stop-reply") {
+            logLine(missionDir, `task ${n}: parent stopped the loop: ${parentSaid.slice(0, 200)}`, verbose);
+            event(missionDir, "parent_stop", { task: n, reason: parentSaid.trim().slice(0, 200) });
+          } else {
+            logLine(missionDir, `task ${n}: ${decision.reason} — stopping`, verbose);
+          }
+          stopReason = decision.reason;
+          break;
+        }
+        if (decision.action === "retry") {
+          logLine(
+            missionDir,
+            `task ${n}: parent did not write TASK.md — re-prompting (attempt ${attempt} of ${parentRetries + 1})`,
+            verbose,
+          );
+          event(missionDir, "parent_retry", { task: n, attempt, reason: decision.reason });
+          continue;
+        }
+        parentOk = true;
       }
+      if (!parentOk) break;
 
       // --- execution-time gate: TASK.md header, else driver.json wait -------
       // A new INBOX.md entry interrupts the wait; the loop restarts so the
@@ -1224,31 +1289,38 @@ function flagValue(name, dflt) {
   return i >= 0 && i + 1 < flags.length ? flags[i + 1] : dflt;
 }
 
-try {
-  if (cmd === "status" && args[0]) {
-    cmdStatus(path.resolve(args[0]), loadDriverConfig(path.resolve(args[0])));
-  } else if (cmd === "list" && args[0]) {
-    cmdList(path.resolve(args[0]), loadDriverConfig(path.resolve(args[0])));
-  } else if ((cmd === "run" || cmd === "start") && args[0]) {
-    const missionDir = path.resolve(args[0]);
-    const code = await cmdRun(missionDir, {
-      max: flagValue("--max", undefined) !== undefined
-        ? Number(flagValue("--max", 0))
-        : undefined,
-      dryRun: flags.includes("--dry-run"),
-      verbose: flags.includes("--verbose"),
-    });
-    process.exitCode = code;
-  } else {
-    console.log(
-      "usage:\n" +
-        "  node driver.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]   (alias: start)\n" +
-        "  node driver.mjs status <mission-dir>\n" +
-        "  node driver.mjs list <mission-dir>",
-    );
-    process.exitCode = 2;
+// Run the CLI only when executed directly (not when imported for tests).
+const isMain =
+  typeof process.argv[1] === "string" &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMain) {
+  try {
+    if (cmd === "status" && args[0]) {
+      cmdStatus(path.resolve(args[0]), loadDriverConfig(path.resolve(args[0])));
+    } else if (cmd === "list" && args[0]) {
+      cmdList(path.resolve(args[0]), loadDriverConfig(path.resolve(args[0])));
+    } else if ((cmd === "run" || cmd === "start") && args[0]) {
+      const missionDir = path.resolve(args[0]);
+      const code = await cmdRun(missionDir, {
+        max: flagValue("--max", undefined) !== undefined
+          ? Number(flagValue("--max", 0))
+          : undefined,
+        dryRun: flags.includes("--dry-run"),
+        verbose: flags.includes("--verbose"),
+      });
+      process.exitCode = code;
+    } else {
+      console.log(
+        "usage:\n" +
+          "  node driver.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]   (alias: start)\n" +
+          "  node driver.mjs status <mission-dir>\n" +
+          "  node driver.mjs list <mission-dir>",
+      );
+      process.exitCode = 2;
+    }
+  } catch (e) {
+    console.error(`driver: ${e.message}`);
+    process.exitCode = 1;
   }
-} catch (e) {
-  console.error(`driver: ${e.message}`);
-  process.exitCode = 1;
 }

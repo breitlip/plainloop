@@ -12,6 +12,9 @@
   ],
   "license": "MIT",
   "type": "module",
+  "scripts": {
+    "test": "node --test test/parent-decision.test.mjs"
+  },
   "bin": {
     "plainloop": "./driver.mjs"
   },
