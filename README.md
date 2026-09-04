@@ -168,11 +168,18 @@ There is also a `plainloop` tool, so you can simply ask the agent:
 
 ## Usage (shell)
 
-A ready-to-run example mission ships in `missions/count-to-1000` (see its
-README) — the smallest mission that exercises the full loop:
+Two ready-to-run example missions ship in `missions/` (see their READMEs):
+
+- `count-to-1000` — the smallest mission that exercises the full loop
+  (no driver.json, parent decides when to stop)
+- `news-monitor` — a scheduled monitor: the parent stamps each TASK.md
+  with an `Execute at:` header at the next 5-minute boundary and the
+  worker refreshes the top 5 goodnewsnetwork.org stories into `latest.md`
+  with its own web tools; no exit criteria (stop it with `stop` or `--max`)
 
 ```bash
 node plainloop.mjs run missions/count-to-1000 --max 5 --verbose
+node plainloop.mjs run missions/news-monitor --max 3 --verbose
 node plainloop.mjs status missions/count-to-1000
 node plainloop.mjs run missions/<name> --dry-run   # show prompts, no pi
 node plainloop.mjs supervise                        # keep missions running (see below)
@@ -224,7 +231,7 @@ tune timeouts and retries.
 | `workerTimeoutSec` | `240` | Worker run timeout before the driver steers it |
 | `steerGraceSec` | `60` | Grace period after steering before aborting |
 | `maxRetries` | `1` | Worker retries per task (each retry gets a parent-written corrective TASK.md) |
-| `parentRetries` | `1` | Retries when the parent settles without writing `TASK.md` and without replying `STOP` (e.g. a thinking-only turn). The driver re-prompts the **same** parent session with a corrective nudge; an explicit `STOP` reply is never retried. `0` = hard-stop on the first such settle |
+| `parentRetries` | `1` | Retries when the parent settles without writing `TASK.md` and without replying `STOP` (e.g. a thinking-only turn). The driver retries with a **fresh** parent session (parents are stateless — the mission files are the context) and a corrective nudge; an explicit `STOP` reply is never retried. `0` = hard-stop on the first such settle |
 | `transientRetryMaxSec` | `14400` | Per-run time budget for **transient** failures (LLM unreachable, session died, timeouts): the driver backs off and retries the same task instead of stopping. `0` = hard-stop (legacy behavior) |
 | `transientBackoffSec` | `60` | Initial backoff delay between transient retries (doubles each consecutive failure) |
 | `transientBackoffCapSec` | `900` | Cap for the transient backoff delay |
@@ -256,10 +263,10 @@ semantic failure consumes one retry:
 timeout, pi process died, steering failed. The driver does NOT stop right
 away — it backs off exponentially (`transientBackoffSec` → `transientBackoffCapSec`)
 and retries the **same task** with a fresh worker, bounded by the per-run
-`transientRetryMaxSec` budget (default 4h). A dead parent session is
-respawned (the loop is file-based, so a fresh parent reads MISSION/STATE/
-history). A new INBOX.md entry interrupts any backoff wait and is routed
-through the parent as usual. Events: `transient_retry`,
+`transientRetryMaxSec` budget (default 4h). A failed parent is simply
+retried with a fresh session (parents are stateless — each one reads
+MISSION/STATE/history). A new INBOX.md entry interrupts any backoff wait and
+is routed through the parent as usual. Events: `transient_retry`,
 `transient_budget_exhausted`, `backoff_interrupted`.
 
 When the budget is exhausted the run exits non-zero — which is exactly what

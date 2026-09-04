@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end: parent settles without TASK.md/STOP → driver re-prompts the
-# same parent instead of hard-stopping (parentRetries).
+# End-to-end: parent settles without TASK.md/STOP → driver retries with a
+# fresh parent instead of hard-stopping (parentRetries).
 #   TEST A: empty settle on attempt 1, TASK.md on attempt 2 → loop continues
 #   TEST B: empty settles on both attempts → stop "after 2 attempts"
 #   TEST C: STOP on the first attempt → stops immediately, no retry
@@ -30,7 +30,7 @@ grep -q 'parent_retry' "$T/a/events.jsonl" || { echo "FAIL A: no parent_retry ev
 grep -q 're-prompting' "$T/a/events.jsonl" || { echo "FAIL A: no retry log line"; A_OK=0; }
 grep -q 'archived history/TASK-0001.md' "$T/a/events.jsonl" || { echo "FAIL A: task never archived"; A_OK=0; }
 grep -q 'after 2 attempts' "$T/a/events.jsonl" && { echo "FAIL A: hard-stopped on missing TASK.md"; A_OK=0; }
-grep -q 'Your previous turn ended without writing TASK.md' "$T/a/.fakepi-prompts" || { echo "FAIL A: retry prompt missing corrective nudge"; A_OK=0; }
+grep -q 'A previous attempt ended without writing TASK.md' "$T/a/.fakepi-prompts" || { echo "FAIL A: retry prompt missing corrective nudge"; A_OK=0; }
 grep -q 'STOP test done' "$T/a/events.jsonl" || { echo "FAIL A: expected STOP at task 2"; A_OK=0; }
 echo "TEST A: $([ $A_OK -eq 1 ] && echo PASS || echo FAIL)"
 echo

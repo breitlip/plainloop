@@ -57,9 +57,6 @@ process.stdin.on("data", (d) => {
         out({ type: "agent_end", messages });
         out({ type: "agent_settled" });
       }, 50);
-    } else if (rec.type === "compact") {
-      out({ type: "response", id: rec.id, success: true });
-      setTimeout(() => out({ type: "compaction_end" }), 50);
     } else if (rec.type === "steer") {
       out({ type: "response", id: rec.id, success: true });
       out({ type: "agent_settled" });

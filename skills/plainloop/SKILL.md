@@ -263,9 +263,12 @@ it; do not invent sizing or task-selection policies.
 
 ## Scaffolding a new mission
 
-A minimal working example ships with the package at
-`missions/count-to-1000/` (relative to the package root) — copy it and
-change the goal. The steps:
+Two working examples ship with the package (relative to the package root):
+`missions/count-to-1000/` (minimal loop, no driver.json) and
+`missions/news-monitor/` (scheduled monitor — the parent stamps each
+TASK.md with an `Execute at:` header at the next 5-minute boundary, the
+worker refreshes latest.md with its own web tools, no exit criteria).
+Copy one and change the goal. The steps:
 
 1. Create `missions/<name>/` with the four files plus an empty `history/`.
 2. MISSION.md: goal, constraints, exit criteria, loop protocol (from above).

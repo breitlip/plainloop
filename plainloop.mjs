@@ -4,8 +4,8 @@
  *
  * Architecture:
  *   driver (this script, no LLM context)
- *     ├─ parent:  one long-lived `pi --mode rpc` session — writes TASK.md,
- *     │           diagnoses failures, gets compacted every N iterations
+ *     ├─ parent:  one `pi --mode rpc` session per task (stateless, fresh
+ *     │           each task) — writes TASK.md, diagnoses failures
  *     └─ worker:  one `pi --mode rpc` session per task — executes TASK.md,
  *                 steered on timeout, aborted if it does not settle
  *
@@ -115,15 +115,11 @@ const DEFAULTS = {
   steerOnInbox: false, // hot path: steer the running worker on new INBOX.md entries
   inboxPollMs: 5000, // inbox poll interval while the worker runs (steerOnInbox)
   countPattern: null, // regex with one capture group, matched in STATE.md
-  compactEvery: 5,
-  compactInstructions:
-    "Preserve: mission dir, current mission state, next task number, " +
-    "loop protocol status, and any open failures.",
   parentTimeoutSec: 180,
   workerTimeoutSec: 240,
   steerGraceSec: 60,
   maxRetries: 1,
-  parentRetries: 1, // parent settles without TASK.md/STOP → re-prompt same session
+  parentRetries: 1, // parent settles without TASK.md/STOP → retry with a fresh parent
   // Transient failures (LLM unreachable, session died, timeouts) back off and
   // retry the same task, bounded by a per-run time budget. 0 = hard-stop (legacy).
   transientRetryMaxSec: 14400, // total backoff budget per run (default 4h)
@@ -134,6 +130,8 @@ const DEFAULTS = {
 /** Keys removed in a release — warn explicitly, ignore the value. */
 const REMOVED_KEYS = {
   review: "the reviewer session was removed in v0.5.0 — the parent judges each outcome",
+  compactEvery: "parent sessions are stateless (fresh per task) — compaction was removed",
+  compactInstructions: "parent sessions are stateless (fresh per task) — compaction was removed",
   reviewTimeoutSec: "the reviewer session was removed in v0.5.0",
   reviewPrompt: "the reviewer session was removed in v0.5.0",
 };
@@ -193,8 +191,8 @@ const STOP_RE = /^\s*STOP\b/i;
  * @param {number} parentRetries configured retries (0 → single attempt)
  * @returns {{action:"stop"|"retry"|"proceed", kind:string, reason:string}}
  *   `stop` — final: an explicit STOP reply (never retried), or no TASK.md
- *   after the last allowed attempt. `retry` — re-prompt the SAME long-lived
- *   parent session with a corrective nudge. `proceed` — TASK.md is present.
+ *   after the last allowed attempt. `retry` — retry with a fresh (stateless)
+ *   parent session and a corrective nudge. `proceed` — TASK.md is present.
  */
 export function decideParentOutcome(reply, taskFileExists, attempt, parentRetries) {
   const text = String(reply ?? "").trim();
@@ -325,8 +323,8 @@ function findMissionSessions(missionDir, sessionCwd) {
   const roleKey = (name) => {
     const role = name.slice("plainloop-".length, name.length - suffix.length);
     if (role === "parent") return [0, 0];
-    const m = role.match(/^(task|review)-?(\d+)$/);
-    return m ? [m[1] === "task" ? 1 : 2, Number(m[2])] : [3, 0];
+    const m = role.match(/^(parent|task|review)-?(\d+)$/);
+    return m ? [m[1] === "parent" ? 0 : m[1] === "task" ? 1 : 2, Number(m[2])] : [3, 0];
   };
   return out.sort((a, b) => {
     const [ra, na] = roleKey(a.name);
@@ -1026,18 +1024,24 @@ async function cmdRun(missionDir, opts) {
 
   event(missionDir, "run_start", { max: opts.max ?? null }, `run started (max=${opts.max ?? "∞"}, workerTimeout=${cfg.workerTimeoutSec}s)`, verbose);
 
-  let parent = new RpcSession({
-    name: `plainloop-parent-${missionName}`,
-    cwd: sessionCwd,
-    label: "parent",
-    verbose,
-  });
-  try {
-    await parent.waitForReady();
-  } catch (e) {
-    parent.kill();
-    throw new Error(`parent session failed to start: ${e.message}`);
-  }
+  // Stateless parent: one fresh `pi --mode rpc` session per prompt — it
+  // reads the mission files, writes TASK.md (or a corrective one), and is
+  // killed. Nothing accumulates, so there is nothing to compact or
+  // respawn; the markdown files are the only durable state.
+  const parentOnce = async (task, message, timeoutMs) => {
+    const p = new RpcSession({
+      name: `plainloop-parent-${String(task).padStart(4, "0")}-${missionName}`,
+      cwd: sessionCwd,
+      label: `parent-${task}`,
+      verbose,
+    });
+    try {
+      await p.waitForReady();
+      return await p.prompt(message, timeoutMs);
+    } finally {
+      p.kill();
+    }
+  };
 
   // Transient-failure budget (per run): LLM-outage retries back off against
   // this total; semantic failures (verify) keep the maxRetries path.
@@ -1105,13 +1109,13 @@ async function cmdRun(missionDir, opts) {
           "(as parent you may edit it); next-step context → TASK.md.";
       }
       // A settle that yields neither STOP nor TASK.md is a model hiccup, not
-      // a direction decision: re-prompt the SAME long-lived parent (it keeps
-      // context) up to cfg.parentRetries times before stopping. A parent
-      // timeout (the throw path) stays a hard stop.
+      // a direction decision: retry with a FRESH parent (stateless — the
+      // mission files are the context) up to cfg.parentRetries times before
+      // stopping. A parent timeout (the throw path) is transient.
       const taskFile = path.join(missionDir, "TASK.md");
       const parentRetries = Math.max(0, Math.floor(Number(cfg.parentRetries) || 0));
       const parentNudge =
-        "\n\nYour previous turn ended without writing TASK.md and without replying " +
+        "\n\nA previous attempt ended without writing TASK.md and without replying " +
         "STOP. Do one of the two now: write TASK.md and reply exactly READY, or " +
         "reply exactly STOP <reason>.";
       let parentOk = false;
@@ -1120,14 +1124,15 @@ async function cmdRun(missionDir, opts) {
       while (!parentOk) {
         let parentSaid = "";
         try {
-          parentSaid = await parent.prompt(
+          parentSaid = await parentOnce(
+            n,
             parentSettleAttempts === 0 ? taskPromptText : taskPromptText + parentNudge,
             cfg.parentTimeoutSec * 1000,
           );
         } catch (e) {
           // Transient: LLM unreachable or the session died. Back off (budget
-          // bounded), respawn the parent if it is dead — the loop is
-          // file-based, so a fresh parent reads MISSION/STATE/history — retry.
+          // bounded) and retry — the parent is stateless, so the next attempt
+          // simply spawns a fresh session that reads MISSION/STATE/history.
           const t = transientRetry(`parent failed: ${e.message}`);
           if (t.action === "stop") {
             event(missionDir, "parent_failed", { note: `task ${n}: parent failed: ${e.message}` }, `task ${n}: parent failed: ${e.message}`, verbose);
@@ -1138,23 +1143,6 @@ async function cmdRun(missionDir, opts) {
           if ((await backoffWait(missionDir, t.delaySec * 1000, verbose, { failure: t.failure, waitedSec: t.waitedSec, budgetSec: transientBudgetSec })) === "interrupted") {
             inboxInterrupted = true;
             break;
-          }
-          if (!parent.alive) {
-            event(missionDir, "parent_respawn", { task: n }, `task ${n}: parent session dead — respawning`, verbose);
-            parent.kill();
-            parent = new RpcSession({
-              name: `plainloop-parent-${missionName}`,
-              cwd: sessionCwd,
-              label: "parent",
-              verbose,
-            });
-            try {
-              await parent.waitForReady();
-            } catch (e2) {
-              event(missionDir, "parent_respawn_failed", { note: `task ${n}: parent respawn failed: ${e2.message}` }, `task ${n}: parent respawn failed: ${e2.message}`, verbose);
-              stopReason = `parent respawn failed: ${e2.message}`;
-              break;
-            }
           }
           continue;
         }
@@ -1293,7 +1281,8 @@ async function cmdRun(missionDir, opts) {
         semanticAttempts += 1;
         event(missionDir, "corrective_parent_start", { note: `task ${n}: parent writing corrective TASK.md (${failure}) …` }, `task ${n}: parent writing corrective TASK.md (${failure}) …`, verbose);
         try {
-          await parent.prompt(
+          await parentOnce(
+            n,
             `Task ${n} failed: ${failure}. Inspect CURRENT.md and STATE.md in ` +
               `${missionDir}, diagnose, and write a corrected, smaller TASK.md ` +
               `for task ${n}. Reply exactly: READY.`,
@@ -1301,6 +1290,7 @@ async function cmdRun(missionDir, opts) {
           );
         } catch (pe) {
           // the corrective parent could not reach the model either — transient
+          // (a fresh parent is spawned on the next attempt)
           const t = transientRetry(`corrective parent failed: ${pe.message}`);
           if (t.action === "stop") {
             event(missionDir, "corrective_parent_failed", { note: `task ${n}: corrective parent failed: ${pe.message}` }, `task ${n}: corrective parent failed: ${pe.message}`, verbose);
@@ -1329,21 +1319,6 @@ async function cmdRun(missionDir, opts) {
       writeState(missionDir, "archived", { task: n });
 
       iterations++;
-
-      // --- periodic parent compaction ----------------------------------------
-      if (iterations % cfg.compactEvery === 0) {
-        event(missionDir, "parent_compacting", { note: `parent: compacting (every ${cfg.compactEvery}) …` }, `parent: compacting (every ${cfg.compactEvery}) …`, verbose);
-        try {
-          await parent.sendOk(
-            { type: "compact", customInstructions: cfg.compactInstructions },
-            120_000,
-          );
-          await parent.waitForEventSince("compaction_end", 0, 120_000).catch(() => {});
-          event(missionDir, "parent_compaction_done", { note: "parent: compaction done" }, "parent: compaction done", verbose);
-        } catch (e) {
-          event(missionDir, "parent_compaction_failed", { note: `parent: compaction failed: ${e.message} (continuing)` }, `parent: compaction failed: ${e.message} (continuing)`, verbose);
-        }
-      }
     }
 
     event(missionDir, "run_end", { reason: stopReason, iterations }, `run finished: ${stopReason} (${iterations} iterations, ${((Date.now() - t0) / 1000).toFixed(0)}s)`, verbose);
@@ -1352,7 +1327,6 @@ async function cmdRun(missionDir, opts) {
   } finally {
     clearPid();
     clearState();
-    parent.kill();
   }
 }
 
@@ -1543,7 +1517,11 @@ for (let i = 0; i < rest.length; i++) {
     flags.push(rest[i]);
     // consume a value token for flags that take one
     if (
-      ["--max", "--compact-every", "--timeout", "--config"].includes(rest[i]) &&
+      [
+        "--max",
+        "--timeout",
+        "--config",
+      ].includes(rest[i]) &&
       i + 1 < rest.length &&
       !rest[i + 1].startsWith("--")
     ) {
