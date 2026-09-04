@@ -43,11 +43,38 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-// Windows: `pi` is an extensionless shim; spawn needs `pi.cmd` + shell:true.
-const PI_BIN =
-  process.env.PI_BIN ??
-  (process.platform === "win32" ? "pi.cmd" : "pi");
-const PI_SHELL = process.platform === "win32" || /\.(cmd|bat)$/i.test(PI_BIN);
+// Windows: `pi` is a .cmd shim (npm-style) that just runs `node <entry.js>`.
+// Resolve the entry script and spawn node directly, so no shell is needed
+// (avoids DEP0190; .cmd files can't be spawned without shell:true anyway).
+function resolvePiLaunch() {
+  const bin =
+    process.env.PI_BIN ??
+    (process.platform === "win32" ? "pi.cmd" : "pi");
+  let file = bin;
+  if (!path.isAbsolute(bin) && !existsSync(bin)) {
+    const found = (process.env.PATH ?? "")
+      .split(path.delimiter)
+      .map((d) => (d ? path.join(d, bin) : null))
+      .find((p) => p && existsSync(p));
+    if (found) file = found;
+  }
+  if (
+    process.platform === "win32" &&
+    /\.(cmd|bat)$/i.test(file) &&
+    existsSync(file)
+  ) {
+    const text = readFileSync(file, "utf8");
+    const m = text.match(/node_modules[^\s"']+/);
+    if (m) {
+      const entry = path.join(path.dirname(file), m[0]);
+      if (existsSync(entry))
+        return { bin: process.execPath, extraArgs: [entry], shell: false };
+    }
+  }
+  return { bin: file, extraArgs: [], shell: process.platform === "win32" };
+}
+const { bin: PI_BIN, extraArgs: PI_EXTRA_ARGS, shell: PI_SHELL } =
+  resolvePiLaunch();
 
 /** Live RPC sessions, so signals can reap them. */
 const liveSessions = new Set();
@@ -659,7 +686,13 @@ class RpcSession {
     this.eventWaiters = [];
     this.alive = false;
 
-    const args = ["--mode", "rpc", "--name", name];
+    const args = [
+      ...PI_EXTRA_ARGS,
+      "--mode",
+      "rpc",
+      "--name",
+      name,
+    ];
     this.proc = spawn(
       PI_BIN,
       args,
