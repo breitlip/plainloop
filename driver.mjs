@@ -41,7 +41,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Windows: `pi` is an extensionless shim; spawn needs `pi.cmd` + shell:true.
 const PI_BIN =
@@ -55,6 +55,7 @@ const liveSessions = new Set();
 let cleanupDone = false;
 let currentPidFile = null;
 let currentStateFile = null;
+let currentSupervisePidFile = null;
 function shutdown(code) {
   if (cleanupDone) return;
   cleanupDone = true;
@@ -68,6 +69,13 @@ function shutdown(code) {
   if (currentStateFile) {
     try {
       rmSync(currentStateFile, { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+  if (currentSupervisePidFile) {
+    try {
+      rmSync(currentSupervisePidFile, { force: true });
     } catch {
       /* best effort */
     }
@@ -116,6 +124,11 @@ const DEFAULTS = {
   steerGraceSec: 60,
   maxRetries: 1,
   parentRetries: 1, // parent settles without TASK.md/STOP → re-prompt same session
+  // Transient failures (LLM unreachable, session died, timeouts) back off and
+  // retry the same task, bounded by a per-run time budget. 0 = hard-stop (legacy).
+  transientRetryMaxSec: 14400, // total backoff budget per run (default 4h)
+  transientBackoffSec: 60, // initial backoff delay
+  transientBackoffCapSec: 900, // backoff delay cap
   review: true,
   reviewTimeoutSec: 120,
   reviewPrompt:
@@ -136,6 +149,32 @@ function loadDriverConfig(missionDir) {
 // ---------------------------------------------------------------------------
 // parent post-settle decision (pure — exported for node --test)
 // ---------------------------------------------------------------------------
+
+/**
+ * Exponential backoff delay for the Nth consecutive transient failure (0-based).
+ * @returns {number} delay in seconds, capped at capSec.
+ */
+export function backoffDelay(consecutive, baseSec, capSec) {
+  const base = Math.max(1, Math.floor(Number(baseSec) || 60));
+  const cap = Math.max(base, Math.floor(Number(capSec) || 900));
+  return Math.min(base * 2 ** Math.max(0, Math.floor(Number(consecutive) || 0)), cap);
+}
+
+/**
+ * Classify a task/parent failure.
+ *   semantic  — the work settled but was judged wrong (verify failed, reviewer
+ *               REJECT): a corrective parent + a new attempt is the remedy.
+ *   transient — the session could not reach the model (timeout, steer failure,
+ *               process death): retrying the same task after a backoff is the
+ *               remedy.
+ * @returns {boolean} true when the failure is transient.
+ */
+export function isTransientFailure(failure) {
+  const f = String(failure ?? "");
+  if (/verify command failed/i.test(f)) return false;
+  if (/^reviewer rejected:/i.test(f)) return false;
+  return true;
+}
 
 const STOP_RE = /^\s*STOP\b/i;
 
@@ -504,6 +543,24 @@ async function awaitSpec(missionDir, spec, label, verbose) {
   }
   logLine(missionDir, `wait (${label}): condition met after ${((Date.now() - started) / 1000).toFixed(0)}s`, verbose);
   event(missionDir, "wait_end", { label, kind: "when" });
+}
+
+/**
+ * Sleep in 1s chunks (SIGTERM stays responsive). A new INBOX.md entry
+ * interrupts (returns "interrupted") WITHOUT advancing the drain cursor —
+ * the caller re-enters the loop and the cold path drains + routes it.
+ */
+async function backoffWait(missionDir, ms, verbose) {
+  const started = Date.now();
+  while (Date.now() - started < ms) {
+    if (hasFreshInboxEntries(missionDir)) {
+      logLine(missionDir, `backoff: interrupted after ${((Date.now() - started) / 1000).toFixed(0)}s by new INBOX.md entry`, verbose);
+      event(missionDir, "backoff_interrupted", { waitedMs: Date.now() - started });
+      return "interrupted";
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return "done";
 }
 
 /**
@@ -914,6 +971,27 @@ async function cmdRun(missionDir, opts) {
 
   // pidfile so `/plainloop stop` (or a human) can find this run
   const pidFile = path.join(missionDir, ".plainloop.pid");
+  // single-instance guard: a live pidfile means another run owns this mission;
+  // a dead one (crash/reboot) is stale — clear it and the stale state file.
+  if (existsSync(pidFile)) {
+    let alive = false;
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    if (Number.isInteger(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0);
+        alive = true;
+      } catch {
+        /* not alive */
+      }
+    }
+    if (alive) {
+      console.log(`already running (pid ${pid}) — stop it first or wait for it to finish`);
+      return 1;
+    }
+    rmSync(pidFile, { force: true });
+    rmSync(path.join(missionDir, ".plainloop.state.json"), { force: true });
+    logLine(missionDir, "cleared stale pidfile from a previous crashed run", verbose);
+  }
   currentPidFile = pidFile;
   writeFileSync(pidFile, String(process.pid));
   currentStateFile = path.join(missionDir, ".plainloop.state.json");
@@ -935,7 +1013,7 @@ async function cmdRun(missionDir, opts) {
   );
   event(missionDir, "run_start", { max: opts.max ?? null });
 
-  const parent = new RpcSession({
+  let parent = new RpcSession({
     name: `plainloop-parent-${missionName}`,
     cwd: sessionCwd,
     label: "parent",
@@ -947,6 +1025,24 @@ async function cmdRun(missionDir, opts) {
     parent.kill();
     throw new Error(`parent session failed to start: ${e.message}`);
   }
+
+  // Transient-failure budget (per run): LLM-outage retries back off against
+  // this total; semantic failures (verify/review) keep the maxRetries path.
+  const transientBudgetSec = Math.max(0, Math.floor(Number(cfg.transientRetryMaxSec) || 0));
+  let consecutiveTransient = 0;
+  let transientWaitedSec = 0;
+  const transientRetry = (failureText) => {
+    const delaySec = backoffDelay(
+      consecutiveTransient,
+      cfg.transientBackoffSec,
+      cfg.transientBackoffCapSec,
+    );
+    if (transientBudgetSec === 0 || transientWaitedSec + delaySec > transientBudgetSec)
+      return { action: "stop", delaySec: 0, waitedSec: transientWaitedSec, failure: failureText };
+    consecutiveTransient += 1;
+    transientWaitedSec += delaySec;
+    return { action: "wait", delaySec, waitedSec: transientWaitedSec, failure: failureText };
+  };
 
   let iterations = 0;
   let stopReason = "completed";
@@ -998,7 +1094,6 @@ async function cmdRun(missionDir, opts) {
       writeState(missionDir, "parent", { task: n });
 
       // --- parent: write the task brief -----------------------------------
-      let parentSaid = "";
       let taskPromptText = render(cfg.taskPrompt, v);
       if (inboxEntries.length > 0) {
         taskPromptText +=
@@ -1018,21 +1113,59 @@ async function cmdRun(missionDir, opts) {
         "STOP. Do one of the two now: write TASK.md and reply exactly READY, or " +
         "reply exactly STOP <reason>.";
       let parentOk = false;
-      for (let attempt = 1; attempt <= parentRetries + 1 && !parentOk; attempt++) {
+      let parentSettleAttempts = 0; // settles without TASK.md/STOP (semantic)
+      let inboxInterrupted = false; // a backoff wait was cut short by INBOX.md
+      while (!parentOk) {
+        let parentSaid = "";
         try {
           parentSaid = await parent.prompt(
-            attempt === 1 ? taskPromptText : taskPromptText + parentNudge,
+            parentSettleAttempts === 0 ? taskPromptText : taskPromptText + parentNudge,
             cfg.parentTimeoutSec * 1000,
           );
         } catch (e) {
-          logLine(missionDir, `task ${n}: parent failed: ${e.message}`, verbose);
-          stopReason = `parent failed: ${e.message}`;
-          break;
+          // Transient: LLM unreachable or the session died. Back off (budget
+          // bounded), respawn the parent if it is dead — the loop is
+          // file-based, so a fresh parent reads MISSION/STATE/history — retry.
+          const t = transientRetry(`parent failed: ${e.message}`);
+          if (t.action === "stop") {
+            logLine(missionDir, `task ${n}: parent failed: ${e.message}`, verbose);
+            stopReason = `parent failed: ${e.message}`;
+            break;
+          }
+          logLine(
+            missionDir,
+            `task ${n}: parent failed (${e.message}) — backing off ${t.delaySec}s (${t.waitedSec}/${transientBudgetSec}s budget)`,
+            verbose,
+          );
+          event(missionDir, "transient_retry", { task: n, failure: t.failure, delaySec: t.delaySec, waitedSec: t.waitedSec });
+          if ((await backoffWait(missionDir, t.delaySec * 1000, verbose)) === "interrupted") {
+            inboxInterrupted = true;
+            break;
+          }
+          if (!parent.alive) {
+            logLine(missionDir, `task ${n}: parent session dead — respawning`, verbose);
+            event(missionDir, "parent_respawn", { task: n });
+            parent.kill();
+            parent = new RpcSession({
+              name: `plainloop-parent-${missionName}`,
+              cwd: sessionCwd,
+              label: "parent",
+              verbose,
+            });
+            try {
+              await parent.waitForReady();
+            } catch (e2) {
+              logLine(missionDir, `task ${n}: parent respawn failed: ${e2.message}`, verbose);
+              stopReason = `parent respawn failed: ${e2.message}`;
+              break;
+            }
+          }
+          continue;
         }
         const decision = decideParentOutcome(
           parentSaid,
           existsSync(taskFile),
-          attempt,
+          parentSettleAttempts + 1,
           parentRetries,
         );
         if (decision.action === "stop") {
@@ -1046,16 +1179,18 @@ async function cmdRun(missionDir, opts) {
           break;
         }
         if (decision.action === "retry") {
+          parentSettleAttempts += 1;
           logLine(
             missionDir,
-            `task ${n}: parent did not write TASK.md — re-prompting (attempt ${attempt} of ${parentRetries + 1})`,
+            `task ${n}: parent did not write TASK.md — re-prompting (settle ${parentSettleAttempts + 1} of ${parentRetries + 1})`,
             verbose,
           );
-          event(missionDir, "parent_retry", { task: n, attempt, reason: decision.reason });
+          event(missionDir, "parent_retry", { task: n, attempt: parentSettleAttempts + 1, reason: decision.reason });
           continue;
         }
         parentOk = true;
       }
+      if (inboxInterrupted) continue; // outer loop: cold path drains + routes the new entry
       if (!parentOk) break;
 
       // --- execution-time gate: TASK.md header, else driver.json wait -------
@@ -1075,7 +1210,10 @@ async function cmdRun(missionDir, opts) {
       const workerTimeoutMs = cfg.workerTimeoutSec * 1000;
       let taskOk = false;
       let failure = "";
-      for (let attempt = 0; attempt <= cfg.maxRetries && !taskOk; attempt++) {
+      let semanticAttempts = 0; // semantic failures that got a corrective parent
+      let workerInboxInterrupted = false;
+      while (!taskOk) {
+        const attempt = semanticAttempts; // logging/naming slot
         failure = ""; // per-attempt: a passing retry must not inherit the old failure
         // -- worker -----------------------------------------------------------
         const worker = new RpcSession({
@@ -1191,34 +1329,74 @@ async function cmdRun(missionDir, opts) {
 
         if (failure === "") {
           taskOk = true;
+          consecutiveTransient = 0; // a passing task resets the backoff
           break;
         }
 
-        // -- corrective parent before the next attempt ------------------------
-        if (attempt < cfg.maxRetries) {
+        if (isTransientFailure(failure)) {
+          // LLM unreachable / session died: back off and retry the SAME task
+          // (fresh worker, same TASK.md), bounded by the transient budget.
+          const t = transientRetry(failure);
+          if (t.action === "stop") {
+            logLine(missionDir, `task ${n}: transient failure (${failure}) — stopping`, verbose);
+            event(missionDir, "transient_budget_exhausted", { task: n, failure, waitedSec: t.waitedSec });
+            stopReason = `task ${n} failed: ${failure} (transient retry ${transientBudgetSec === 0 ? "disabled" : `budget exhausted after ${t.waitedSec}s`})`;
+            break;
+          }
           logLine(
             missionDir,
-            `task ${n}: parent writing corrective TASK.md (${failure}) …`,
+            `task ${n}: transient failure (${failure}) — backing off ${t.delaySec}s (${t.waitedSec}/${transientBudgetSec}s budget)`,
             verbose,
           );
-          try {
-            await parent.prompt(
-              `Task ${n} failed: ${failure}. Inspect CURRENT.md and STATE.md in ` +
-                `${missionDir}, diagnose, and write a corrected, smaller TASK.md ` +
-                `for task ${n}. Reply exactly: READY.`,
-              180_000,
-            );
-          } catch (pe) {
+          event(missionDir, "transient_retry", { task: n, failure, delaySec: t.delaySec, waitedSec: t.waitedSec });
+          if ((await backoffWait(missionDir, t.delaySec * 1000, verbose)) === "interrupted") {
+            workerInboxInterrupted = true;
+            break;
+          }
+          continue;
+        }
+
+        // -- semantic: corrective parent before the next attempt -------------
+        if (semanticAttempts >= cfg.maxRetries) break;
+        semanticAttempts += 1;
+        logLine(
+          missionDir,
+          `task ${n}: parent writing corrective TASK.md (${failure}) …`,
+          verbose,
+        );
+        try {
+          await parent.prompt(
+            `Task ${n} failed: ${failure}. Inspect CURRENT.md and STATE.md in ` +
+              `${missionDir}, diagnose, and write a corrected, smaller TASK.md ` +
+              `for task ${n}. Reply exactly: READY.`,
+            180_000,
+          );
+        } catch (pe) {
+          // the corrective parent could not reach the model either — transient
+          const t = transientRetry(`corrective parent failed: ${pe.message}`);
+          if (t.action === "stop") {
             logLine(missionDir, `task ${n}: corrective parent failed: ${pe.message}`, verbose);
             stopReason = `corrective parent failed: ${pe.message}`;
             break;
           }
+          logLine(
+            missionDir,
+            `task ${n}: corrective parent failed (${pe.message}) — backing off ${t.delaySec}s`,
+            verbose,
+          );
+          event(missionDir, "transient_retry", { task: n, failure: t.failure, delaySec: t.delaySec, waitedSec: t.waitedSec });
+          if ((await backoffWait(missionDir, t.delaySec * 1000, verbose)) === "interrupted") {
+            workerInboxInterrupted = true;
+            break;
+          }
+          continue; // same TASK.md, fresh worker
         }
       }
+      if (workerInboxInterrupted) continue; // outer loop: cold path drains + routes the new entry
       if (!taskOk) {
         logLine(
           missionDir,
-          `task ${n}: failed after up to ${cfg.maxRetries + 1} attempts: ${failure}`,
+          `task ${n}: failed after ${semanticAttempts + 1} attempt(s): ${failure}`,
           verbose,
         );
         stopReason = `task ${n} failed: ${failure}`;
@@ -1262,6 +1440,181 @@ async function cmdRun(missionDir, opts) {
 }
 
 // ---------------------------------------------------------------------------
+// supervise — keep a set of missions running across crashes and reboots
+// ---------------------------------------------------------------------------
+
+/**
+ * Supervise config: `~/.config/plainloop/supervise.json` (or --config):
+ *   {
+ *     "missions": ["/abs/mission-dir", {"dir": "/abs/mission", "verbose": true}],
+ *     "pollSec": 30, "backoffSec": 60, "maxBackoffSec": 900
+ *   }
+ * A mission that exits 0 (completed / exit criteria met) is marked done and
+ * not relaunched; a mission that exits non-zero is relaunched with
+ * exponential backoff. The supervisor itself needs no LLM.
+ */
+function loadSuperviseConfig(configPath) {
+  const raw = JSON.parse(readFileSync(configPath, "utf8"));
+  const missions = (Array.isArray(raw.missions) ? raw.missions : []).map((m) =>
+    typeof m === "string" ? { dir: m, verbose: true } : { dir: m.dir, verbose: m.verbose ?? true },
+  );
+  return {
+    missions,
+    pollSec: Math.max(5, Math.floor(Number(raw.pollSec) || 30)),
+    backoffSec: Math.max(5, Math.floor(Number(raw.backoffSec) || 60)),
+    maxBackoffSec: Math.max(60, Math.floor(Number(raw.maxBackoffSec) || 900)),
+  };
+}
+
+async function cmdSupervise(opts) {
+  const configPath = path.resolve(
+    opts.config ?? path.join(homedir(), ".config", "plainloop", "supervise.json"),
+  );
+  if (!existsSync(configPath)) {
+    console.error(`supervise: config not found: ${configPath}`);
+    return 1;
+  }
+  let cfg;
+  try {
+    cfg = loadSuperviseConfig(configPath);
+  } catch (e) {
+    console.error(`supervise: bad config: ${e.message}`);
+    return 1;
+  }
+  if (cfg.missions.length === 0) {
+    console.error("supervise: no missions configured");
+    return 1;
+  }
+
+  // single supervisor instance (stale pidfile from a crash/reboot is cleared)
+  const pidFile = path.join(path.dirname(configPath), ".supervise.pid");
+  if (existsSync(pidFile)) {
+    let alive = false;
+    const pid = Number(readFileSync(pidFile, "utf8").trim());
+    if (Number.isInteger(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0);
+        alive = true;
+      } catch {
+        /* not alive */
+      }
+    }
+    if (alive) {
+      console.error(`supervise: already running (pid ${pid})`);
+      return 1;
+    }
+    rmSync(pidFile, { force: true });
+  }
+  writeFileSync(pidFile, String(process.pid));
+  currentSupervisePidFile = pidFile;
+
+  const state = new Map();
+  for (const m of cfg.missions)
+    state.set(path.resolve(m.dir), {
+      status: "idle", // idle | done
+      consecutive: 0,
+      nextAttemptAt: 0,
+      child: null,
+      warned: false,
+    });
+
+  let stopping = false;
+  // Replace the global signal handlers: kill child drivers FIRST, then run
+  // the standard shutdown (pidfile cleanup + exit). Order matters — the
+  // global handler alone would exit before the children are reaped.
+  const onSignal = () => {
+    if (stopping) return;
+    stopping = true;
+    for (const s of state.values()) {
+      try {
+        s.child?.kill("SIGTERM");
+      } catch {
+        /* already gone */
+      }
+    }
+    shutdown(143);
+  };
+  process.removeAllListeners("SIGTERM");
+  process.removeAllListeners("SIGINT");
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+
+  console.log(
+    `supervise: ${cfg.missions.length} mission(s), poll=${cfg.pollSec}s, backoff=${cfg.backoffSec}s..${cfg.maxBackoffSec}s`,
+  );
+  let lastTick = 0;
+  while (!stopping) {
+    await new Promise((r) => setTimeout(r, 1000));
+    const now = Date.now();
+    if (now - lastTick < cfg.pollSec * 1000) continue;
+    lastTick = now;
+    for (const m of cfg.missions) {
+      const dir = path.resolve(m.dir);
+      const s = state.get(dir);
+      if (!existsSync(dir) || !existsSync(path.join(dir, "MISSION.md"))) {
+        if (!s.warned) {
+          console.log(`supervise: mission dir missing — skipping: ${dir}`);
+          s.warned = true;
+        }
+        continue;
+      }
+      if (s.status === "done" || s.child) continue;
+      if (now < s.nextAttemptAt) continue;
+      // exit criteria met (same check the driver uses) → done, not relaunched
+      let dcfg;
+      try {
+        dcfg = loadDriverConfig(dir);
+      } catch {
+        dcfg = null;
+      }
+      if (dcfg?.exit && sh(render(dcfg.exit, { dir }), dir)) {
+        console.log(`supervise: ${path.basename(dir)} — exit criteria met, marked done`);
+        s.status = "done";
+        continue;
+      }
+      // launch the driver; per-mission logs as with the systemd unit
+      const out = openSync(path.join(dir, "driver.out.log"), "a");
+      const err = openSync(path.join(dir, "driver.err.log"), "a");
+      console.log(
+        `supervise: starting ${path.basename(dir)}${s.consecutive ? ` (retry #${s.consecutive})` : ""} — log: ${path.join(dir, "driver.out.log")}`,
+      );
+      const child = spawn(
+        process.execPath,
+        [fileURLToPath(import.meta.url), "run", dir, "--verbose"],
+        { stdio: ["ignore", out, err] },
+      );
+      s.child = child;
+      child.on("close", (code) => {
+        s.child = null;
+        if (stopping) return;
+        if (code === 0) {
+          console.log(`supervise: ${path.basename(dir)} exited 0 — marked done`);
+          s.status = "done";
+          s.consecutive = 0;
+        } else {
+          s.consecutive += 1;
+          const delaySec = Math.min(
+            cfg.backoffSec * 2 ** (s.consecutive - 1),
+            cfg.maxBackoffSec,
+          );
+          s.nextAttemptAt = Date.now() + delaySec * 1000;
+          console.log(
+            `supervise: ${path.basename(dir)} exited ${code} — retry in ${delaySec}s (log: ${path.join(dir, "driver.out.log")})`,
+          );
+        }
+      });
+    }
+  }
+  try {
+    rmSync(pidFile, { force: true });
+  } catch {
+    /* best effort */
+  }
+  console.log("supervise: stopped");
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // cli
 // ---------------------------------------------------------------------------
 
@@ -1273,7 +1626,7 @@ for (let i = 0; i < rest.length; i++) {
     flags.push(rest[i]);
     // consume a value token for flags that take one
     if (
-      ["--max", "--compact-every", "--timeout"].includes(rest[i]) &&
+      ["--max", "--compact-every", "--timeout", "--config"].includes(rest[i]) &&
       i + 1 < rest.length &&
       !rest[i + 1].startsWith("--")
     ) {
@@ -1310,10 +1663,14 @@ if (isMain) {
         verbose: flags.includes("--verbose"),
       });
       process.exitCode = code;
+    } else if (cmd === "supervise") {
+      const code = await cmdSupervise({ config: flagValue("--config", undefined) });
+      process.exitCode = code;
     } else {
       console.log(
         "usage:\n" +
           "  node driver.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]   (alias: start)\n" +
+          "  node driver.mjs supervise [--config PATH]   # keep missions running across crashes/reboots\n" +
           "  node driver.mjs status <mission-dir>\n" +
           "  node driver.mjs list <mission-dir>",
       );

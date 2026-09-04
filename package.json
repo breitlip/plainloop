@@ -1,6 +1,6 @@
 {
   "name": "plainloop",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "description": "Endless-loop mission driver for pi: a stateless RPC driver that steers parent, worker, and read-only reviewer pi sessions across a markdown mission contract (MISSION/STATE/TASK/history).",
   "keywords": [
     "pi-package",
@@ -13,7 +13,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "test": "node --test test/parent-decision.test.mjs"
+    "test": "node --test"
   },
   "bin": {
     "plainloop": "./driver.mjs"

@@ -177,6 +177,7 @@ There is also a `plainloop` tool, so you can simply ask the agent:
 node driver.mjs run missions/count-to-1000 --max 5 --verbose
 node driver.mjs status missions/count-to-1000
 node driver.mjs run missions/<name> --dry-run   # show prompts, no pi
+node driver.mjs supervise                        # keep missions running (see below)
 ```
 
 Flags:
@@ -223,13 +224,19 @@ Flags:
 | `steerGraceSec` | `60` | Grace period after steering before aborting |
 | `maxRetries` | `1` | Worker retries per task (each retry gets a parent-written corrective TASK.md) |
 | `parentRetries` | `1` | Retries when the parent settles without writing `TASK.md` and without replying `STOP` (e.g. a thinking-only turn). The driver re-prompts the **same** long-lived parent session with a corrective nudge; an explicit `STOP` reply is never retried. `0` = hard-stop on the first such settle |
+| `transientRetryMaxSec` | `14400` | Per-run time budget for **transient** failures (LLM unreachable, session died, timeouts): the driver backs off and retries the same task instead of stopping. `0` = hard-stop (legacy behavior) |
+| `transientBackoffSec` | `60` | Initial backoff delay between transient retries (doubles each consecutive failure) |
+| `transientBackoffCapSec` | `900` | Cap for the transient backoff delay |
 | `steerOnInbox` | `false` | Hot path: new INBOX.md entries while the worker runs steer the live worker session (`priority: stop` in an entry aborts it) |
 | `inboxPollMs` | `5000` | Inbox poll interval while the worker runs (only used with `steerOnInbox`) |
 
 ## Failure handling
 
-Per task, the driver runs: **worker → verify → review → archive**. Any of
-the three checks failing consumes one retry:
+Failures split into two classes, handled differently:
+
+**Semantic** (the work settled but was judged wrong): verify failed, or the
+reviewer replied `REJECT`. Per task the driver runs **worker → verify →
+review → archive**, and each semantic failure consumes one retry:
 
 1. Worker times out → driver sends a `steer` ("stop, finish the minimal
    STATE.md update") → grace period → `abort`.
@@ -240,10 +247,77 @@ the three checks failing consumes one retry:
    `driver.log` and a non-zero exit code. Resume by fixing the files and
    running again — the loop is stateless; `history/` + STATE.md is the truth.
 
+**Transient** (the session could not reach the model): LLM unreachable,
+timeout, pi process died, steering failed. The driver does NOT stop right
+away — it backs off exponentially (`transientBackoffSec` → `transientBackoffCapSec`)
+and retries the **same task** with a fresh worker, bounded by the per-run
+`transientRetryMaxSec` budget (default 4h). A dead parent session is
+respawned (the loop is file-based, so a fresh parent reads MISSION/STATE/
+history). A new INBOX.md entry interrupts any backoff wait and is routed
+through the parent as usual. Events: `transient_retry`,
+`transient_budget_exhausted`, `parent_respawn`, `backoff_interrupted`.
+
+When the budget is exhausted the run exits non-zero — which is exactly what
+`supervise` (below) turns into a backoff + relaunch.
+
 The reviewer is a fresh, **read-only** session (`--exclude-tools
 bash,edit,write`) that judges the worker's claimed result against MISSION.md,
 STATE.md, TASK.md and CURRENT.md. It cannot modify anything; it only replies
 `APPROVE` or `REJECT <reason>`.
+
+## Supervise (crash / reboot resilience)
+
+`plainloop supervise [--config PATH]` is a plain-Node supervisor (no LLM
+needed) that keeps a configured set of missions running:
+
+```json
+// ~/.config/plainloop/supervise.json
+{
+  "missions": ["/abs/path/to/mission"],
+  "pollSec": 30,
+  "backoffSec": 60,
+  "maxBackoffSec": 900
+}
+```
+
+Per mission, every poll:
+
+- **exit criteria met** (the mission's `driver.json` `exit` command succeeds)
+  → marked done, never relaunched;
+- **already running** (live pidfile) → left alone;
+- **failed previously** → relaunched after exponential backoff
+  (`backoffSec` → `maxBackoffSec`);
+- otherwise → launched as `plainloop run <mission> --verbose`, logging to
+  the mission's `driver.out.log` / `driver.err.log` as before.
+
+Exit 0 (mission completed) marks it done; exit 1 (failure) schedules a
+relaunch. The supervisor is single-instance (pidfile next to the config,
+stale pidfiles from crashes/reboots are cleared), and `run` itself refuses
+to start a second instance for the same mission.
+
+### systemd (user service, survives reboots)
+
+```ini
+# ~/.config/systemd/user/plainloop-supervise.service
+[Unit]
+Description=Plainloop mission supervisor
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /path/to/plainloop/driver.mjs supervise
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now plainloop-supervise
+loginctl enable-linger $USER   # start at boot without a login session
+```
 
 ## Notes
 
