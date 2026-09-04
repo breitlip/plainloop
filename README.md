@@ -258,7 +258,12 @@ through the parent as usual. Events: `transient_retry`,
 `transient_budget_exhausted`, `parent_respawn`, `backoff_interrupted`.
 
 When the budget is exhausted the run exits non-zero — which is exactly what
-`supervise` (below) turns into a backoff + relaunch.
+`supervise` (below) turns into a backoff + relaunch. While a backoff wait is
+in flight, `plainloop status` shows the live state instead of a stale phase:
+
+```
+current:      waiting on LLM — retry in 00:04:31 (budget 180/14400s) — last: worker did not settle
+```
 
 The reviewer is a fresh, **read-only** session (`--exclude-tools
 bash,edit,write`) that judges the worker's claimed result against MISSION.md,

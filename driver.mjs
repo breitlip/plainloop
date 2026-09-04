@@ -396,6 +396,12 @@ function currentStateLine(missionDir) {
     }
     return `wait — polling \`${st.command ?? "?"}\` (since ${st.since ?? "?"}) — ${st.label ?? "wait"}`;
   }
+  if (st.phase === "waiting-llm") {
+    const rem = st.until ? Math.max(0, st.until - Date.now()) : 0;
+    const budget =
+      st.budgetSec !== undefined ? ` (budget ${st.waitedSec ?? 0}/${st.budgetSec}s)` : "";
+    return `waiting on LLM — retry in ${hhmmss(rem)}${budget} — last: ${st.failure ?? "?"}`;
+  }
   return `run — ${st.phase}${st.task !== undefined ? ` (task ${st.task})` : ""} (since ${st.since ?? "?"})`;
 }
 
@@ -549,8 +555,17 @@ async function awaitSpec(missionDir, spec, label, verbose) {
  * Sleep in 1s chunks (SIGTERM stays responsive). A new INBOX.md entry
  * interrupts (returns "interrupted") WITHOUT advancing the drain cursor —
  * the caller re-enters the loop and the cold path drains + routes it.
+ * While waiting, the state file carries the `waiting-llm` phase so
+ * `plainloop status` renders a live countdown instead of a stale phase.
  */
-async function backoffWait(missionDir, ms, verbose) {
+async function backoffWait(missionDir, ms, verbose, info) {
+  writeState(missionDir, "waiting-llm", {
+    label: "LLM backoff",
+    until: Date.now() + ms,
+    failure: info?.failure,
+    waitedSec: info?.waitedSec,
+    budgetSec: info?.budgetSec,
+  });
   const started = Date.now();
   while (Date.now() - started < ms) {
     if (hasFreshInboxEntries(missionDir)) {
@@ -1138,7 +1153,7 @@ async function cmdRun(missionDir, opts) {
             verbose,
           );
           event(missionDir, "transient_retry", { task: n, failure: t.failure, delaySec: t.delaySec, waitedSec: t.waitedSec });
-          if ((await backoffWait(missionDir, t.delaySec * 1000, verbose)) === "interrupted") {
+          if ((await backoffWait(missionDir, t.delaySec * 1000, verbose, { failure: t.failure, waitedSec: t.waitedSec, budgetSec: transientBudgetSec })) === "interrupted") {
             inboxInterrupted = true;
             break;
           }
@@ -1349,7 +1364,7 @@ async function cmdRun(missionDir, opts) {
             verbose,
           );
           event(missionDir, "transient_retry", { task: n, failure, delaySec: t.delaySec, waitedSec: t.waitedSec });
-          if ((await backoffWait(missionDir, t.delaySec * 1000, verbose)) === "interrupted") {
+          if ((await backoffWait(missionDir, t.delaySec * 1000, verbose, { failure, waitedSec: t.waitedSec, budgetSec: transientBudgetSec })) === "interrupted") {
             workerInboxInterrupted = true;
             break;
           }
@@ -1385,7 +1400,7 @@ async function cmdRun(missionDir, opts) {
             verbose,
           );
           event(missionDir, "transient_retry", { task: n, failure: t.failure, delaySec: t.delaySec, waitedSec: t.waitedSec });
-          if ((await backoffWait(missionDir, t.delaySec * 1000, verbose)) === "interrupted") {
+          if ((await backoffWait(missionDir, t.delaySec * 1000, verbose, { failure: t.failure, waitedSec: t.waitedSec, budgetSec: transientBudgetSec })) === "interrupted") {
             workerInboxInterrupted = true;
             break;
           }
