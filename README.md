@@ -95,11 +95,13 @@ Body: what to add and where it belongs…
 
 ### Event log
 
-`events.jsonl` in the mission dir: one `{ts, event, detail}` line per driver
-action — task start/end, parent/worker spawn/settle/timeout/retry, verify,
-inbox drain, wait begin/end/interrupt. Append-only, machine-readable; gives
-crash recovery, timing analysis, and an audit trail. `status` renders the
-last N events.
+`events.jsonl` in the mission dir: one `{ts, event, detail, msg?}` line per
+driver action — task start/end, parent/worker spawn/settle/timeout/retry,
+verify, inbox drain, wait begin/end/interrupt. Append-only,
+machine-readable; gives crash recovery, timing analysis, and an audit trail.
+It is the single event log (there is no separate text log) — each record
+carries a human-readable `msg` when one applies. `status` renders the last
+N events.
 
 ## Install
 
@@ -145,8 +147,8 @@ The package ships a pi extension, so in any pi session (TUI, RPC, pi-web):
 
 `status` answers "is it actually running?" — driver pid liveness, the
 current phase (`run — worker (task 3)` or `wait until … (remaining hh:mm:ss)`),
-the last `driver.log` lines, the last `events.jsonl` events, plus a work
-summary (latest completed task, CURRENT.md, STATE.md).
+the last `events.jsonl` events, plus a work summary (latest completed task,
+CURRENT.md, STATE.md).
 
 `list` shows every plainloop session for the mission (parent, task-NNNN, and
 legacy review-NNNN) with last activity and size — they live in pi-web under
@@ -194,10 +196,9 @@ Flags:
 ├── INBOX.md      optional drop-in entries, drained by the driver each iteration
 ├── history/      completed briefs: TASK-0001.md, TASK-0002.md, ...
 ├── driver.json   driver contract (all keys optional)
-├── events.jsonl  append-only timestamped driver event log
+├── events.jsonl  append-only timestamped driver event log (the single log)
 ├── .plainloop.state.json  current phase (run/wait), cleared when the run ends
-├── driver.log    append-only driver activity log
-└── driver.err.log driver stderr (crash diagnostics) when started via the extension
+└── plainloop.err.log driver stderr (crash diagnostics) when started via the extension
 ```
 
 ### driver.json (optional)
@@ -248,7 +249,7 @@ semantic failure consumes one retry:
 2. Verify fails → the parent inspects CURRENT.md/STATE.md (plus the failure
    reason) and writes a corrected, smaller TASK.md.
 3. Retries exhausted (`maxRetries`) → driver stops with a clear line in
-   `driver.log` and a non-zero exit code. Resume by fixing the files and
+   `events.jsonl` and a non-zero exit code. Resume by fixing the files and
    running again — the loop is stateless; `history/` + STATE.md is the truth.
 
 **Transient** (the session could not reach the model): LLM unreachable,
@@ -296,7 +297,7 @@ Per mission, every poll:
 - **failed previously** → relaunched after exponential backoff
   (`backoffSec` → `maxBackoffSec`);
 - otherwise → launched as `plainloop run <mission> --verbose`, logging to
-  the mission's `driver.out.log` / `driver.err.log` as before.
+  the mission's `plainloop.out.log` / `plainloop.err.log` as before.
 
 Exit 0 (mission completed — exit criteria met, or the parent replied `STOP`
 with a done verdict) marks it done; exit 1 (failure) schedules a relaunch. The supervisor is single-instance (pidfile next to the config,

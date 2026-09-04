@@ -165,7 +165,7 @@ export default function plainloop(pi: ExtensionAPI) {
     // keep the driver's stderr so a crash is diagnosable (was: "ignore")
     let errFd: number | "ignore" = "ignore";
     try {
-      errFd = openSync(path.join(mission, "driver.err.log"), "a");
+      errFd = openSync(path.join(mission, "plainloop.err.log"), "a");
     } catch {
       errFd = "ignore";
     }
@@ -185,7 +185,7 @@ export default function plainloop(pi: ExtensionAPI) {
       notify(
         code === 0
           ? `plainloop: run finished (exit 0) — ${path.basename(mission)}`
-          : `plainloop: run finished (exit ${code ?? "signal"}) — check ${path.join(mission, "driver.log")}`,
+          : `plainloop: run finished (exit ${code ?? "signal"}) — check ${path.join(mission, "events.jsonl")}`,
         code === 0 ? "info" : "warning",
       );
     });
@@ -194,7 +194,7 @@ export default function plainloop(pi: ExtensionAPI) {
       text: (() => {
         const idx = findMissions(cwd).indexOf(mission);
         const ref = idx >= 0 ? String(idx + 1) : mission;
-        return `started (pid ${pid}) — log: ${path.join(mission, "driver.log")}; stop with /plainloop stop ${ref}`;
+        return `started (pid ${pid}) — log: ${path.join(mission, "events.jsonl")}; stop with /plainloop stop ${ref}`;
       })(),
     };
   }

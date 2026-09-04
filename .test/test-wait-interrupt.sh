@@ -24,8 +24,6 @@ wait $DPID
 CODE=$?
 END=$(date +%s)
 echo "exit code: $CODE   wall time: $((END-START))s (want ~5-8s, NOT ~15s)"
-echo "--- driver.log ---"
-cat "$T/mission/driver.log"
 echo "--- events.jsonl ---"
 cat "$T/mission/events.jsonl" 2>/dev/null
 echo
@@ -39,8 +37,6 @@ wait $DPID
 CODE=$?
 END=$(date +%s)
 echo "exit code: $CODE   wall time: $((END-START))s (want ~6-8s)"
-echo "--- driver.log ---"
-cat "$T/mission2/driver.log"
 echo "--- events.jsonl ---"
 cat "$T/mission2/events.jsonl" 2>/dev/null
 rm -rf "$T"

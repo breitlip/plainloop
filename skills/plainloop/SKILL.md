@@ -223,10 +223,10 @@ Reference implementation flow per task:
   always wins over the schedule.
 - **Hot path (opt-in, `steerOnInbox`)** — new inbox entries while the worker
   runs steer the live worker session; `priority: stop` in an entry aborts it.
-- **events.jsonl** — append-only `{ts, event, detail}` log of every driver
-  action (task start, worker settle/timeout, verify, archive, inbox
-  drain, wait begin/end/interrupt). `status` renders the last events and the
-  current
+- **events.jsonl** — append-only `{ts, event, detail, msg?}` log of every
+  driver action (task start, worker settle/timeout, verify, archive, inbox
+  drain, wait begin/end/interrupt). It is the single log — there is no
+  separate text log. `status` renders the last events and the current
   phase: `run — worker (task 3)` or `wait until … (remaining hh:mm:ss)`.
 
 ## Relay driver (pi-web)

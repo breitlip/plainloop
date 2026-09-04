@@ -20,8 +20,8 @@
  *   driver.json  machine-readable driver contract (see README.md)
  *
  * Usage:
- *   node driver.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]
- *   node driver.mjs status <mission-dir>
+ *   node plainloop.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]
+ *   node plainloop.mjs status <mission-dir>
  */
 
 import { spawn, execSync } from "node:child_process";
@@ -365,20 +365,18 @@ function historyTasks(missionDir) {
     .map((f) => f.replace(/^TASK-(\d+)\.md$/, (m, d) => Number(d)));
 }
 
-function logLine(missionDir, line, verbose) {
-  const stamp = new Date().toISOString();
-  const msg = `${stamp} ${line}\n`;
-  appendFileSync(path.join(missionDir, "driver.log"), msg);
-  if (verbose) process.stdout.write(msg);
-}
-
-/** Append one timestamped event to events.jsonl (best effort). */
-function event(missionDir, name, detail = {}) {
+/**
+ * Append one timestamped event to events.jsonl (best effort). The single
+ * event log of a mission: every driver action lands here as one
+ * `{ts, event, ...detail, msg?}` line. When `msg` is given it is stored in
+ * the record and, with `verbose`, echoed to stdout.
+ */
+function event(missionDir, name, detail = {}, msg = null, verbose = false) {
   try {
-    appendFileSync(
-      path.join(missionDir, "events.jsonl"),
-      JSON.stringify({ ts: new Date().toISOString(), event: name, ...detail }) + "\n",
-    );
+    const record = { ts: new Date().toISOString(), event: name, ...detail };
+    if (msg !== null) record.msg = msg;
+    appendFileSync(path.join(missionDir, "events.jsonl"), JSON.stringify(record) + "\n");
+    if (verbose && msg) process.stdout.write(`${record.ts} ${msg}\n`);
   } catch {
     /* best effort */
   }
@@ -528,47 +526,36 @@ async function awaitSpec(missionDir, spec, label, verbose) {
     let delay = spec.value - Date.now();
     if (delay <= 0) return;
     writeState(missionDir, "waiting", { label, kind: "at", until: spec.value });
-    logLine(
-      missionDir,
-      `wait (${label}): until ${new Date(spec.value).toISOString()} (~${Math.round(delay / 1000)}s)`,
-      verbose,
-    );
-    event(missionDir, "wait_start", { label, kind: "at", until: new Date(spec.value).toISOString() });
+    event(missionDir, "wait_start", { label, kind: "at", until: new Date(spec.value).toISOString() }, `wait (${label}): until ${new Date(spec.value).toISOString()} (~${Math.round(delay / 1000)}s)`, verbose);
     while (delay > 0) {
       if (hasFreshInboxEntries(missionDir)) {
-        logLine(missionDir, `wait (${label}): interrupted by new INBOX.md entries`, verbose);
-        event(missionDir, "wait_interrupted", { label, kind: "at" });
+        event(missionDir, "wait_interrupted", { label, kind: "at" }, `wait (${label}): interrupted by new INBOX.md entries`, verbose);
         return "interrupted";
       }
       await new Promise((r) => setTimeout(r, Math.min(delay, 1000)));
       delay = spec.value - Date.now();
     }
-    logLine(missionDir, `wait (${label}): time reached`, verbose);
-    event(missionDir, "wait_end", { label, kind: "at" });
+    event(missionDir, "wait_end", { label, kind: "at" }, `wait (${label}): time reached`, verbose);
     return;
   }
   const intervalMs = spec.intervalMs ?? 30_000;
   const timeoutMs = spec.timeoutMs ?? 0;
   const started = Date.now();
   writeState(missionDir, "waiting", { label, kind: "when", command: spec.command });
-  logLine(missionDir, `wait (${label}): polling \`${spec.command}\` every ${Math.round(intervalMs / 1000)}s`, verbose);
-  event(missionDir, "wait_start", { label, kind: "when", command: spec.command });
+  event(missionDir, "wait_start", { label, kind: "when", command: spec.command }, `wait (${label}): polling \`${spec.command}\` every ${Math.round(intervalMs / 1000)}s`, verbose);
   for (;;) {
     if (sh(spec.command, missionDir)) break;
     if (hasFreshInboxEntries(missionDir)) {
-      logLine(missionDir, `wait (${label}): interrupted by new INBOX.md entries`, verbose);
-      event(missionDir, "wait_interrupted", { label, kind: "when" });
+      event(missionDir, "wait_interrupted", { label, kind: "when" }, `wait (${label}): interrupted by new INBOX.md entries`, verbose);
       return "interrupted";
     }
     if (timeoutMs > 0 && Date.now() - started > timeoutMs) {
-      logLine(missionDir, `wait (${label}): timeout — continuing anyway`, verbose);
-      event(missionDir, "wait_timeout", { label, kind: "when" });
+      event(missionDir, "wait_timeout", { label, kind: "when" }, `wait (${label}): timeout — continuing anyway`, verbose);
       return;
     }
     await new Promise((r) => setTimeout(r, intervalMs));
   }
-  logLine(missionDir, `wait (${label}): condition met after ${((Date.now() - started) / 1000).toFixed(0)}s`, verbose);
-  event(missionDir, "wait_end", { label, kind: "when" });
+  event(missionDir, "wait_end", { label, kind: "when" }, `wait (${label}): condition met after ${((Date.now() - started) / 1000).toFixed(0)}s`, verbose);
 }
 
 /**
@@ -589,8 +576,7 @@ async function backoffWait(missionDir, ms, verbose, info) {
   const started = Date.now();
   while (Date.now() - started < ms) {
     if (hasFreshInboxEntries(missionDir)) {
-      logLine(missionDir, `backoff: interrupted after ${((Date.now() - started) / 1000).toFixed(0)}s by new INBOX.md entry`, verbose);
-      event(missionDir, "backoff_interrupted", { waitedMs: Date.now() - started });
+      event(missionDir, "backoff_interrupted", { waitedMs: Date.now() - started }, `backoff: interrupted after ${((Date.now() - started) / 1000).toFixed(0)}s by new INBOX.md entry`, verbose);
       return "interrupted";
     }
     await new Promise((r) => setTimeout(r, 1000));
@@ -631,8 +617,7 @@ async function workerPromptWatchingInbox(worker, missionDir, cfg, message, timeo
       const fresh = newInboxEntries(missionDir); // advances the drain cursor
       if (fresh.length > 0) {
         if (fresh.some((entry) => /^\s*priority:\s*stop\s*$/im.test(entry))) {
-          logLine(missionDir, `inbox: priority:stop — aborting worker`, verbose);
-          event(missionDir, "inbox_abort", { entries: fresh.length });
+          event(missionDir, "inbox_abort", { entries: fresh.length }, `inbox: priority:stop — aborting worker`, verbose);
           try {
             await worker.sendOk({ type: "abort" }, 15_000);
           } catch {
@@ -640,12 +625,7 @@ async function workerPromptWatchingInbox(worker, missionDir, cfg, message, timeo
           }
           throw new Error(`${worker.label}: aborted by inbox (priority: stop)`);
         }
-        logLine(
-          missionDir,
-          `inbox: steering worker with ${fresh.length} new entr${fresh.length === 1 ? "y" : "ies"}`,
-          verbose,
-        );
-        event(missionDir, "inbox_steer", { entries: fresh.length });
+        event(missionDir, "inbox_steer", { entries: fresh.length }, `inbox: steering worker with ${fresh.length} new entr${fresh.length === 1 ? "y" : "ies"}`, verbose);
         try {
           await worker.sendOk(
             {
@@ -657,7 +637,7 @@ async function workerPromptWatchingInbox(worker, missionDir, cfg, message, timeo
             15_000,
           );
         } catch (se) {
-          logLine(missionDir, `inbox: steer failed: ${se.message}`, verbose);
+          event(missionDir, "inbox_steer_failed", { note: `inbox: steer failed: ${se.message}` }, `inbox: steer failed: ${se.message}`, verbose);
         }
       }
       baseline = mtimeOf();
@@ -889,10 +869,12 @@ function cmdStatus(missionDir, cfg) {
     console.log(`driver:       not running (no pidfile)`);
   }
 
+  // driver.log is legacy (pre events.jsonl) — show it read-only if an old
+  // mission still has one; new runs no longer write it.
   const logFile = path.join(missionDir, "driver.log");
   if (existsSync(logFile)) {
     const st = statSync(logFile);
-    console.log(`driver.log:   ${st.size} bytes, last activity ${ageStr(Date.now() - st.mtimeMs)}`);
+    console.log(`driver.log:   ${st.size} bytes (legacy), last activity ${ageStr(Date.now() - st.mtimeMs)}`);
     for (const l of tailLines(logFile, 3)) console.log(`  | ${l}`);
   }
   const evFile = path.join(missionDir, "events.jsonl");
@@ -910,10 +892,13 @@ function cmdStatus(missionDir, cfg) {
       console.log(`  | ${line}`);
     }
   }
-  const errFile = path.join(missionDir, "driver.err.log");
-  if (existsSync(errFile) && statSync(errFile).size > 0) {
-    console.log(`driver.err.log: ${statSync(errFile).size} bytes — check it`);
-    for (const l of tailLines(errFile, 3)) console.log(`  ! ${l}`);
+  // stderr log: plainloop.err.log (current name), driver.err.log (legacy)
+  for (const errName of ["plainloop.err.log", "driver.err.log"]) {
+    const errFile = path.join(missionDir, errName);
+    if (existsSync(errFile) && statSync(errFile).size > 0) {
+      console.log(`${errName}: ${statSync(errFile).size} bytes — check it`);
+      for (const l of tailLines(errFile, 3)) console.log(`  ! ${l}`);
+    }
   }
 
   // work summary: what was done, what is in flight, durable state
@@ -963,7 +948,7 @@ async function cmdRun(missionDir, opts) {
   const sessionCwd =
     cfg.sessionCwd ?? (gitRoot(missionDir) || missionDir);
   if (sessionCwd !== missionDir)
-    logLine(missionDir, `session cwd: ${sessionCwd}`, verbose);
+    event(missionDir, "session_cwd", { note: `session cwd: ${sessionCwd}` }, `session cwd: ${sessionCwd}`, verbose);
   const vars = () => {
     const done = historyTasks(missionDir);
     const state = existsSync(path.join(missionDir, "STATE.md"))
@@ -998,7 +983,7 @@ async function cmdRun(missionDir, opts) {
   }
 
   if (exitMet()) {
-    logLine(missionDir, "exit criteria already met — nothing to do", verbose);
+    event(missionDir, "exit_already_met", { note: "exit criteria already met — nothing to do" }, "exit criteria already met — nothing to do", verbose);
     return 0;
   }
 
@@ -1023,7 +1008,7 @@ async function cmdRun(missionDir, opts) {
     }
     rmSync(pidFile, { force: true });
     rmSync(path.join(missionDir, ".plainloop.state.json"), { force: true });
-    logLine(missionDir, "cleared stale pidfile from a previous crashed run", verbose);
+    event(missionDir, "stale_pidfile_cleared", { note: "cleared stale pidfile from a previous crashed run" }, "cleared stale pidfile from a previous crashed run", verbose);
   }
   currentPidFile = pidFile;
   writeFileSync(pidFile, String(process.pid));
@@ -1039,12 +1024,7 @@ async function cmdRun(missionDir, opts) {
     } catch {}
   };
 
-  logLine(
-    missionDir,
-    `run started (max=${opts.max ?? "∞"}, workerTimeout=${cfg.workerTimeoutSec}s)`,
-    verbose,
-  );
-  event(missionDir, "run_start", { max: opts.max ?? null });
+  event(missionDir, "run_start", { max: opts.max ?? null }, `run started (max=${opts.max ?? "∞"}, workerTimeout=${cfg.workerTimeoutSec}s)`, verbose);
 
   let parent = new RpcSession({
     name: `plainloop-parent-${missionName}`,
@@ -1097,12 +1077,7 @@ async function cmdRun(missionDir, opts) {
       const inboxEntries = newInboxEntries(missionDir);
       let waited = false;
       if (inboxEntries.length > 0) {
-        logLine(
-          missionDir,
-          `task ${n}: inbox drained ${inboxEntries.length} new entr${inboxEntries.length === 1 ? "y" : "ies"}`,
-          verbose,
-        );
-        event(missionDir, "inbox_drain", { task: n, entries: inboxEntries.length });
+        event(missionDir, "inbox_drain", { task: n, entries: inboxEntries.length }, `task ${n}: inbox drained ${inboxEntries.length} new entr${inboxEntries.length === 1 ? "y" : "ies"}`, verbose);
         const inboxSpec = inboxEntries.map(execSpecFromText).find(Boolean) ?? null;
         if (inboxSpec) {
           const r = await awaitSpec(missionDir, inboxSpec, "inbox", verbose);
@@ -1110,20 +1085,14 @@ async function cmdRun(missionDir, opts) {
           if (r === "interrupted") {
             const more = newInboxEntries(missionDir);
             if (more.length > 0) {
-              logLine(
-                missionDir,
-                `task ${n}: wait interrupted — ${more.length} more inbox entr${more.length === 1 ? "y" : "ies"} drained`,
-                verbose,
-              );
-              event(missionDir, "inbox_drain", { task: n, entries: more.length, interrupted: true });
+              event(missionDir, "inbox_drain", { task: n, entries: more.length, interrupted: true }, `task ${n}: wait interrupted — ${more.length} more inbox entr${more.length === 1 ? "y" : "ies"} drained`, verbose);
               inboxEntries.push(...more);
             }
           }
         }
       }
 
-      logLine(missionDir, `task ${n}: parent writing TASK.md …`, verbose);
-      event(missionDir, "task_start", { task: n });
+      event(missionDir, "task_start", { task: n }, `task ${n}: parent writing TASK.md …`, verbose);
       writeState(missionDir, "parent", { task: n });
 
       // --- parent: write the task brief -----------------------------------
@@ -1161,23 +1130,17 @@ async function cmdRun(missionDir, opts) {
           // file-based, so a fresh parent reads MISSION/STATE/history — retry.
           const t = transientRetry(`parent failed: ${e.message}`);
           if (t.action === "stop") {
-            logLine(missionDir, `task ${n}: parent failed: ${e.message}`, verbose);
+            event(missionDir, "parent_failed", { note: `task ${n}: parent failed: ${e.message}` }, `task ${n}: parent failed: ${e.message}`, verbose);
             stopReason = `parent failed: ${e.message}`;
             break;
           }
-          logLine(
-            missionDir,
-            `task ${n}: parent failed (${e.message}) — backing off ${t.delaySec}s (${t.waitedSec}/${transientBudgetSec}s budget)`,
-            verbose,
-          );
-          event(missionDir, "transient_retry", { task: n, failure: t.failure, delaySec: t.delaySec, waitedSec: t.waitedSec });
+          event(missionDir, "transient_retry", { task: n, failure: t.failure, delaySec: t.delaySec, waitedSec: t.waitedSec }, `task ${n}: parent failed (${e.message}) — backing off ${t.delaySec}s (${t.waitedSec}/${transientBudgetSec}s budget)`, verbose);
           if ((await backoffWait(missionDir, t.delaySec * 1000, verbose, { failure: t.failure, waitedSec: t.waitedSec, budgetSec: transientBudgetSec })) === "interrupted") {
             inboxInterrupted = true;
             break;
           }
           if (!parent.alive) {
-            logLine(missionDir, `task ${n}: parent session dead — respawning`, verbose);
-            event(missionDir, "parent_respawn", { task: n });
+            event(missionDir, "parent_respawn", { task: n }, `task ${n}: parent session dead — respawning`, verbose);
             parent.kill();
             parent = new RpcSession({
               name: `plainloop-parent-${missionName}`,
@@ -1188,7 +1151,7 @@ async function cmdRun(missionDir, opts) {
             try {
               await parent.waitForReady();
             } catch (e2) {
-              logLine(missionDir, `task ${n}: parent respawn failed: ${e2.message}`, verbose);
+              event(missionDir, "parent_respawn_failed", { note: `task ${n}: parent respawn failed: ${e2.message}` }, `task ${n}: parent respawn failed: ${e2.message}`, verbose);
               stopReason = `parent respawn failed: ${e2.message}`;
               break;
             }
@@ -1203,22 +1166,16 @@ async function cmdRun(missionDir, opts) {
         );
         if (decision.action === "stop") {
           if (decision.kind === "stop-reply") {
-            logLine(missionDir, `task ${n}: parent stopped the loop: ${parentSaid.slice(0, 200)}`, verbose);
-            event(missionDir, "parent_stop", { task: n, reason: parentSaid.trim().slice(0, 200) });
+            event(missionDir, "parent_stop", { task: n, reason: parentSaid.trim().slice(0, 200) }, `task ${n}: parent stopped the loop: ${parentSaid.slice(0, 200)}`, verbose);
           } else {
-            logLine(missionDir, `task ${n}: ${decision.reason} — stopping`, verbose);
+            event(missionDir, "parent_no_task_stop", { note: `task ${n}: ${decision.reason} — stopping` }, `task ${n}: ${decision.reason} — stopping`, verbose);
           }
           stopReason = decision.reason;
           break;
         }
         if (decision.action === "retry") {
           parentSettleAttempts += 1;
-          logLine(
-            missionDir,
-            `task ${n}: parent did not write TASK.md — re-prompting (settle ${parentSettleAttempts + 1} of ${parentRetries + 1})`,
-            verbose,
-          );
-          event(missionDir, "parent_retry", { task: n, attempt: parentSettleAttempts + 1, reason: decision.reason });
+          event(missionDir, "parent_retry", { task: n, attempt: parentSettleAttempts + 1, reason: decision.reason }, `task ${n}: parent did not write TASK.md — re-prompting (settle ${parentSettleAttempts + 1} of ${parentRetries + 1})`, verbose);
           continue;
         }
         parentOk = true;
@@ -1273,19 +1230,9 @@ async function cmdRun(missionDir, opts) {
             await worker.prompt(render(cfg.workerPrompt, v), workerTimeoutMs);
           }
           workerSettled = true;
-          logLine(
-            missionDir,
-            `task ${n}: worker settled in ${((Date.now() - wStart) / 1000).toFixed(1)}s`,
-            verbose,
-          );
-          event(missionDir, "worker_settled", { task: n, attempt: attempt + 1, ms: Date.now() - wStart });
+          event(missionDir, "worker_settled", { task: n, attempt: attempt + 1, ms: Date.now() - wStart }, `task ${n}: worker settled in ${((Date.now() - wStart) / 1000).toFixed(1)}s`, verbose);
         } catch (e) {
-          logLine(
-            missionDir,
-            `task ${n}: worker ${e.message} — steering …`,
-            verbose,
-          );
-          event(missionDir, "worker_timeout", { task: n, attempt: attempt + 1, error: e.message });
+          event(missionDir, "worker_timeout", { task: n, attempt: attempt + 1, error: e.message }, `task ${n}: worker ${e.message} — steering …`, verbose);
           // steer once, wait for settle within the grace period
           try {
             await worker.sendOk(
@@ -1299,7 +1246,7 @@ async function cmdRun(missionDir, opts) {
             );
             await worker.waitForEventSince("agent_settled", 0, cfg.steerGraceSec * 1000);
             workerSettled = true; // steered to completion; checks will judge the result
-            logLine(missionDir, `task ${n}: worker settled after steer`, verbose);
+            event(missionDir, "worker_settled_after_steer", { note: `task ${n}: worker settled after steer` }, `task ${n}: worker settled after steer`, verbose);
           } catch {
             /* steering failed or did not settle in time */
           }
@@ -1311,11 +1258,9 @@ async function cmdRun(missionDir, opts) {
         // -- verify (deterministic, against the count captured before this task) --
         if (workerSettled && cfg.verify) {
           if (sh(render(cfg.verify, v), missionDir)) {
-            logLine(missionDir, `task ${n}: verify OK`, verbose);
-            event(missionDir, "verify_ok", { task: n, attempt: attempt + 1 });
+            event(missionDir, "verify_ok", { task: n, attempt: attempt + 1 }, `task ${n}: verify OK`, verbose);
           } else {
-            logLine(missionDir, `task ${n}: verify FAILED (attempt ${attempt + 1})`, verbose);
-            event(missionDir, "verify_fail", { task: n, attempt: attempt + 1 });
+            event(missionDir, "verify_fail", { task: n, attempt: attempt + 1 }, `task ${n}: verify FAILED (attempt ${attempt + 1})`, verbose);
             failure = "verify command failed";
           }
         }
@@ -1331,17 +1276,11 @@ async function cmdRun(missionDir, opts) {
           // (fresh worker, same TASK.md), bounded by the transient budget.
           const t = transientRetry(failure);
           if (t.action === "stop") {
-            logLine(missionDir, `task ${n}: transient failure (${failure}) — stopping`, verbose);
-            event(missionDir, "transient_budget_exhausted", { task: n, failure, waitedSec: t.waitedSec });
+            event(missionDir, "transient_budget_exhausted", { task: n, failure, waitedSec: t.waitedSec }, `task ${n}: transient failure (${failure}) — stopping`, verbose);
             stopReason = `task ${n} failed: ${failure} (transient retry ${transientBudgetSec === 0 ? "disabled" : `budget exhausted after ${t.waitedSec}s`})`;
             break;
           }
-          logLine(
-            missionDir,
-            `task ${n}: transient failure (${failure}) — backing off ${t.delaySec}s (${t.waitedSec}/${transientBudgetSec}s budget)`,
-            verbose,
-          );
-          event(missionDir, "transient_retry", { task: n, failure, delaySec: t.delaySec, waitedSec: t.waitedSec });
+          event(missionDir, "transient_retry", { task: n, failure, delaySec: t.delaySec, waitedSec: t.waitedSec }, `task ${n}: transient failure (${failure}) — backing off ${t.delaySec}s (${t.waitedSec}/${transientBudgetSec}s budget)`, verbose);
           if ((await backoffWait(missionDir, t.delaySec * 1000, verbose, { failure, waitedSec: t.waitedSec, budgetSec: transientBudgetSec })) === "interrupted") {
             workerInboxInterrupted = true;
             break;
@@ -1352,11 +1291,7 @@ async function cmdRun(missionDir, opts) {
         // -- semantic: corrective parent before the next attempt -------------
         if (semanticAttempts >= cfg.maxRetries) break;
         semanticAttempts += 1;
-        logLine(
-          missionDir,
-          `task ${n}: parent writing corrective TASK.md (${failure}) …`,
-          verbose,
-        );
+        event(missionDir, "corrective_parent_start", { note: `task ${n}: parent writing corrective TASK.md (${failure}) …` }, `task ${n}: parent writing corrective TASK.md (${failure}) …`, verbose);
         try {
           await parent.prompt(
             `Task ${n} failed: ${failure}. Inspect CURRENT.md and STATE.md in ` +
@@ -1368,16 +1303,11 @@ async function cmdRun(missionDir, opts) {
           // the corrective parent could not reach the model either — transient
           const t = transientRetry(`corrective parent failed: ${pe.message}`);
           if (t.action === "stop") {
-            logLine(missionDir, `task ${n}: corrective parent failed: ${pe.message}`, verbose);
+            event(missionDir, "corrective_parent_failed", { note: `task ${n}: corrective parent failed: ${pe.message}` }, `task ${n}: corrective parent failed: ${pe.message}`, verbose);
             stopReason = `corrective parent failed: ${pe.message}`;
             break;
           }
-          logLine(
-            missionDir,
-            `task ${n}: corrective parent failed (${pe.message}) — backing off ${t.delaySec}s`,
-            verbose,
-          );
-          event(missionDir, "transient_retry", { task: n, failure: t.failure, delaySec: t.delaySec, waitedSec: t.waitedSec });
+          event(missionDir, "transient_retry", { task: n, failure: t.failure, delaySec: t.delaySec, waitedSec: t.waitedSec }, `task ${n}: corrective parent failed (${pe.message}) — backing off ${t.delaySec}s`, verbose);
           if ((await backoffWait(missionDir, t.delaySec * 1000, verbose, { failure: t.failure, waitedSec: t.waitedSec, budgetSec: transientBudgetSec })) === "interrupted") {
             workerInboxInterrupted = true;
             break;
@@ -1387,11 +1317,7 @@ async function cmdRun(missionDir, opts) {
       }
       if (workerInboxInterrupted) continue; // outer loop: cold path drains + routes the new entry
       if (!taskOk) {
-        logLine(
-          missionDir,
-          `task ${n}: failed after ${semanticAttempts + 1} attempt(s): ${failure}`,
-          verbose,
-        );
+        event(missionDir, "task_failed", { note: `task ${n}: failed after ${semanticAttempts + 1} attempt(s): ${failure}` }, `task ${n}: failed after ${semanticAttempts + 1} attempt(s): ${failure}`, verbose);
         stopReason = `task ${n} failed: ${failure}`;
         break;
       }
@@ -1399,30 +1325,28 @@ async function cmdRun(missionDir, opts) {
       // --- archive ------------------------------------------------------------
       const archiveName = `TASK-${String(n).padStart(4, "0")}.md`;
       renameSync(path.join(missionDir, "TASK.md"), path.join(missionDir, "history", archiveName));
-      logLine(missionDir, `task ${n}: archived history/${archiveName}`, verbose);
-      event(missionDir, "archived", { task: n, file: archiveName });
+      event(missionDir, "archived", { task: n, file: archiveName }, `task ${n}: archived history/${archiveName}`, verbose);
       writeState(missionDir, "archived", { task: n });
 
       iterations++;
 
       // --- periodic parent compaction ----------------------------------------
       if (iterations % cfg.compactEvery === 0) {
-        logLine(missionDir, `parent: compacting (every ${cfg.compactEvery}) …`, verbose);
+        event(missionDir, "parent_compacting", { note: `parent: compacting (every ${cfg.compactEvery}) …` }, `parent: compacting (every ${cfg.compactEvery}) …`, verbose);
         try {
           await parent.sendOk(
             { type: "compact", customInstructions: cfg.compactInstructions },
             120_000,
           );
           await parent.waitForEventSince("compaction_end", 0, 120_000).catch(() => {});
-          logLine(missionDir, "parent: compaction done", verbose);
+          event(missionDir, "parent_compaction_done", { note: "parent: compaction done" }, "parent: compaction done", verbose);
         } catch (e) {
-          logLine(missionDir, `parent: compaction failed: ${e.message} (continuing)`, verbose);
+          event(missionDir, "parent_compaction_failed", { note: `parent: compaction failed: ${e.message} (continuing)` }, `parent: compaction failed: ${e.message} (continuing)`, verbose);
         }
       }
     }
 
-    logLine(missionDir, `run finished: ${stopReason} (${iterations} iterations, ${((Date.now() - t0) / 1000).toFixed(0)}s)`, verbose);
-    event(missionDir, "run_end", { reason: stopReason, iterations });
+    event(missionDir, "run_end", { reason: stopReason, iterations }, `run finished: ${stopReason} (${iterations} iterations, ${((Date.now() - t0) / 1000).toFixed(0)}s)`, verbose);
     console.log(`\ndriver: ${stopReason} — ${iterations} iteration(s) this run`);
     return runExitCode(stopReason);
   } finally {
@@ -1566,10 +1490,10 @@ async function cmdSupervise(opts) {
         continue;
       }
       // launch the driver; per-mission logs as with the systemd unit
-      const out = openSync(path.join(dir, "driver.out.log"), "a");
-      const err = openSync(path.join(dir, "driver.err.log"), "a");
+      const out = openSync(path.join(dir, "plainloop.out.log"), "a");
+      const err = openSync(path.join(dir, "plainloop.err.log"), "a");
       console.log(
-        `supervise: starting ${path.basename(dir)}${s.consecutive ? ` (retry #${s.consecutive})` : ""} — log: ${path.join(dir, "driver.out.log")}`,
+        `supervise: starting ${path.basename(dir)}${s.consecutive ? ` (retry #${s.consecutive})` : ""} — log: ${path.join(dir, "plainloop.out.log")}`,
       );
       const child = spawn(
         process.execPath,
@@ -1592,7 +1516,7 @@ async function cmdSupervise(opts) {
           );
           s.nextAttemptAt = Date.now() + delaySec * 1000;
           console.log(
-            `supervise: ${path.basename(dir)} exited ${code} — retry in ${delaySec}s (log: ${path.join(dir, "driver.out.log")})`,
+            `supervise: ${path.basename(dir)} exited ${code} — retry in ${delaySec}s (log: ${path.join(dir, "plainloop.out.log")})`,
           );
         }
       });
@@ -1662,10 +1586,10 @@ if (isMain) {
     } else {
       console.log(
         "usage:\n" +
-          "  node driver.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]   (alias: start)\n" +
-          "  node driver.mjs supervise [--config PATH]   # keep missions running across crashes/reboots\n" +
-          "  node driver.mjs status <mission-dir>\n" +
-          "  node driver.mjs list <mission-dir>",
+          "  node plainloop.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]   (alias: start)\n" +
+          "  node plainloop.mjs supervise [--config PATH]   # keep missions running across crashes/reboots\n" +
+          "  node plainloop.mjs status <mission-dir>\n" +
+          "  node plainloop.mjs list <mission-dir>",
       );
       process.exitCode = 2;
     }

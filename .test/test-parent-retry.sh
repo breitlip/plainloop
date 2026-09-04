@@ -23,17 +23,15 @@ new_mission "$T/a"
 PI_BIN="$FAKEPI" FAKE_PARENT_EMPTY=1 node "$REPO/plainloop.mjs" run "$T/a" --verbose
 CODE=$?
 echo "exit code: $CODE (want 1 — stopped later by parent STOP, not by missing TASK.md)"
-echo "--- driver.log ---"
-cat "$T/a/driver.log"
 echo "--- events.jsonl ---"
 cat "$T/a/events.jsonl"
 A_OK=1
 grep -q 'parent_retry' "$T/a/events.jsonl" || { echo "FAIL A: no parent_retry event"; A_OK=0; }
-grep -q 're-prompting (attempt 1 of 2)' "$T/a/driver.log" || { echo "FAIL A: no retry log line"; A_OK=0; }
-grep -q 'archived history/TASK-0001.md' "$T/a/driver.log" || { echo "FAIL A: task never archived"; A_OK=0; }
-grep -q 'after 2 attempts' "$T/a/driver.log" && { echo "FAIL A: hard-stopped on missing TASK.md"; A_OK=0; }
+grep -q 're-prompting' "$T/a/events.jsonl" || { echo "FAIL A: no retry log line"; A_OK=0; }
+grep -q 'archived history/TASK-0001.md' "$T/a/events.jsonl" || { echo "FAIL A: task never archived"; A_OK=0; }
+grep -q 'after 2 attempts' "$T/a/events.jsonl" && { echo "FAIL A: hard-stopped on missing TASK.md"; A_OK=0; }
 grep -q 'Your previous turn ended without writing TASK.md' "$T/a/.fakepi-prompts" || { echo "FAIL A: retry prompt missing corrective nudge"; A_OK=0; }
-grep -q 'parent: STOP test done' "$T/a/driver.log" || { echo "FAIL A: expected STOP at task 2"; A_OK=0; }
+grep -q 'STOP test done' "$T/a/events.jsonl" || { echo "FAIL A: expected STOP at task 2"; A_OK=0; }
 echo "TEST A: $([ $A_OK -eq 1 ] && echo PASS || echo FAIL)"
 echo
 
@@ -42,12 +40,10 @@ new_mission "$T/b"
 PI_BIN="$FAKEPI" FAKE_PARENT_EMPTY=2 node "$REPO/plainloop.mjs" run "$T/b" --verbose
 CODE=$?
 echo "exit code: $CODE (want 1)"
-echo "--- driver.log ---"
-cat "$T/b/driver.log"
 echo "--- events.jsonl ---"
 cat "$T/b/events.jsonl"
 B_OK=1
-grep -q 'parent did not write TASK.md after 2 attempts' "$T/b/driver.log" || { echo "FAIL B: wrong stop reason"; B_OK=0; }
+grep -q 'parent did not write TASK.md after 2 attempts' "$T/b/events.jsonl" || { echo "FAIL B: wrong stop reason"; B_OK=0; }
 [ "$(grep -c 'parent_retry' "$T/b/events.jsonl")" = "1" ] || { echo "FAIL B: expected exactly 1 parent_retry event"; B_OK=0; }
 echo "TEST B: $([ $B_OK -eq 1 ] && echo PASS || echo FAIL)"
 echo
@@ -57,10 +53,10 @@ new_mission "$T/c"
 PI_BIN="$FAKEPI" FAKE_PARENT_STOP=1 node "$REPO/plainloop.mjs" run "$T/c" --verbose
 CODE=$?
 echo "exit code: $CODE (want 1)"
-echo "--- driver.log ---"
-cat "$T/c/driver.log"
+echo "--- events.jsonl ---"
+cat "$T/c/events.jsonl"
 C_OK=1
-grep -q 'parent: STOP done on first try' "$T/c/driver.log" || { echo "FAIL C: wrong stop reason"; C_OK=0; }
+grep -q 'STOP done on first try' "$T/c/events.jsonl" || { echo "FAIL C: wrong stop reason"; C_OK=0; }
 grep -q 'parent_retry' "$T/c/events.jsonl" 2>/dev/null && { echo "FAIL C: STOP must never be retried"; C_OK=0; }
 echo "TEST C: $([ $C_OK -eq 1 ] && echo PASS || echo FAIL)"
 
