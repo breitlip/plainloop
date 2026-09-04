@@ -16,11 +16,12 @@
     "test": "node --test"
   },
   "bin": {
-    "plainloop": "./driver.mjs"
+    "plainloop": "./plainloop.mjs"
   },
   "files": [
-    "driver.mjs",
+    "plainloop.mjs",
     "skills/",
+    "missions/",
     "README.md"
   ],
   "pi": {

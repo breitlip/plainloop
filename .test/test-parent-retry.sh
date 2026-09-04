@@ -20,7 +20,7 @@ cd "$T"
 
 echo "=== TEST A: retry succeeds on attempt 2 → loop continues ==="
 new_mission "$T/a"
-PI_BIN="$FAKEPI" FAKE_PARENT_EMPTY=1 node "$REPO/driver.mjs" run "$T/a" --verbose
+PI_BIN="$FAKEPI" FAKE_PARENT_EMPTY=1 node "$REPO/plainloop.mjs" run "$T/a" --verbose
 CODE=$?
 echo "exit code: $CODE (want 1 — stopped later by parent STOP, not by missing TASK.md)"
 echo "--- driver.log ---"
@@ -39,7 +39,7 @@ echo
 
 echo "=== TEST B: budget exhausted → stop after 2 attempts ==="
 new_mission "$T/b"
-PI_BIN="$FAKEPI" FAKE_PARENT_EMPTY=2 node "$REPO/driver.mjs" run "$T/b" --verbose
+PI_BIN="$FAKEPI" FAKE_PARENT_EMPTY=2 node "$REPO/plainloop.mjs" run "$T/b" --verbose
 CODE=$?
 echo "exit code: $CODE (want 1)"
 echo "--- driver.log ---"
@@ -54,7 +54,7 @@ echo
 
 echo "=== TEST C: STOP on first attempt → immediate stop, no retry ==="
 new_mission "$T/c"
-PI_BIN="$FAKEPI" FAKE_PARENT_STOP=1 node "$REPO/driver.mjs" run "$T/c" --verbose
+PI_BIN="$FAKEPI" FAKE_PARENT_STOP=1 node "$REPO/plainloop.mjs" run "$T/c" --verbose
 CODE=$?
 echo "exit code: $CODE (want 1)"
 echo "--- driver.log ---"

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { backoffDelay, isTransientFailure } from "../driver.mjs";
+import { backoffDelay, isTransientFailure } from "../plainloop.mjs";
 
 test("backoffDelay doubles per consecutive failure and caps", () => {
   assert.equal(backoffDelay(0, 60, 900), 60);

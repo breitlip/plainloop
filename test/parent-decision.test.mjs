@@ -1,10 +1,11 @@
-// node --test — parent post-settle decision (decideParentOutcome in driver.mjs).
+// node --test — parent post-settle decision (decideParentOutcome) and run
+// exit-code mapping (runExitCode) in plainloop.mjs.
 // Covers: STOP reply → stop; TASK.md exists → proceed; empty reply, no file,
 // attempts left → retry; empty reply, no file, budget exhausted → stop with
-// "after N attempts".
+// "after N attempts"; exit code 0 for good endings, 1 for failures.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decideParentOutcome } from "../driver.mjs";
+import { decideParentOutcome, runExitCode } from "../plainloop.mjs";
 
 test("STOP reply → stop (final, never retried)", () => {
   const d = decideParentOutcome("STOP mission complete", false, 1, 1);
@@ -41,4 +42,16 @@ test("parentRetries 0 → single attempt, no retry", () => {
   const d = decideParentOutcome("", false, 1, 0);
   assert.equal(d.action, "stop");
   assert.equal(d.reason, "parent did not write TASK.md after 1 attempt");
+});
+
+test("runExitCode: good endings → 0, failures → 1", () => {
+  // good endings: supervise must mark these done, never relaunch
+  assert.equal(runExitCode("completed"), 0);
+  assert.equal(runExitCode("exit criteria met"), 0);
+  assert.equal(runExitCode("parent stop: STOP counter reached 1000"), 0);
+  // failures: supervise must relaunch with backoff
+  assert.equal(runExitCode("--max 5 reached"), 1);
+  assert.equal(runExitCode("parent failed: pi process exited"), 1);
+  assert.equal(runExitCode("parent did not write TASK.md after 2 attempts"), 1);
+  assert.equal(runExitCode("task 3 failed: verify command failed"), 1);
 });

@@ -212,6 +212,21 @@ export function decideParentOutcome(reply, taskFileExists, attempt, parentRetrie
   };
 }
 
+/**
+ * Map a run's stop reason to a process exit code: 0 for good endings
+ * (completed, exit criteria met, parent STOP reply), 1 for failures
+ * (--max reached, parent/worker failures, retries exhausted). supervise
+ * uses this to decide whether to mark a mission done or relaunch it with
+ * backoff.
+ */
+export function runExitCode(stopReason) {
+  const r = String(stopReason ?? "");
+  if (r === "completed") return 0;
+  if (r.startsWith("exit")) return 0;
+  if (r.startsWith("parent stop") || /^parent: stop\b/i.test(r)) return 0;
+  return 1;
+}
+
 // ---------------------------------------------------------------------------
 // tiny helpers
 // ---------------------------------------------------------------------------
@@ -1409,7 +1424,7 @@ async function cmdRun(missionDir, opts) {
     logLine(missionDir, `run finished: ${stopReason} (${iterations} iterations, ${((Date.now() - t0) / 1000).toFixed(0)}s)`, verbose);
     event(missionDir, "run_end", { reason: stopReason, iterations });
     console.log(`\ndriver: ${stopReason} — ${iterations} iteration(s) this run`);
-    return stopReason === "completed" || stopReason.startsWith("exit") ? 0 : 1;
+    return runExitCode(stopReason);
   } finally {
     clearPid();
     clearState();

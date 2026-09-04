@@ -8,9 +8,10 @@ the machinery.
 ## How it works
 
 ```
-plainloop/driver.mjs (no LLM context)
-  ├─ parent    one long-lived `pi --mode rpc` session (plainloop-parent-<mission>)
-  │             writes TASK.md, diagnoses failures, compacted every N tasks
+plainloop/plainloop.mjs (no LLM context)
+  ├─ parent    one `pi --mode rpc` session per task (plainloop-parent-NNNN-<mission>)
+  │             writes TASK.md, diagnoses failures — fresh each task (stateless,
+  │             nothing accumulates, nothing to compact)
   └─ worker    one `pi --mode rpc` session per task (plainloop-task-NNNN-<mission>)
                 executes TASK.md; steered on timeout, aborted if it never settles
 ```
@@ -46,10 +47,7 @@ flowchart TD
     RETRYQ -- yes --> CORRECT["parent writes corrective TASK.md"]
     CORRECT --> PARENT
     RETRYQ -- no --> FAIL([stop: retries exhausted])
-    ARCHIVE --> COMPACT{every N tasks?}
-    COMPACT -- yes --> C[compact parent session]
-    C --> EXIT
-    COMPACT -- no --> EXIT
+    ARCHIVE --> EXIT
 ```
 
 ### Execution-time headers
@@ -98,7 +96,7 @@ Body: what to add and where it belongs…
 ### Event log
 
 `events.jsonl` in the mission dir: one `{ts, event, detail}` line per driver
-action — task start/end, worker spawn/settle/timeout/retry, verify, compact,
+action — task start/end, parent/worker spawn/settle/timeout/retry, verify,
 inbox drain, wait begin/end/interrupt. Append-only, machine-readable; gives
 crash recovery, timing analysis, and an audit trail. `status` renders the
 last N events.
@@ -168,11 +166,14 @@ There is also a `plainloop` tool, so you can simply ask the agent:
 
 ## Usage (shell)
 
+A ready-to-run example mission ships in `missions/count-to-1000` (see its
+README) — the smallest mission that exercises the full loop:
+
 ```bash
-node driver.mjs run missions/count-to-1000 --max 5 --verbose
-node driver.mjs status missions/count-to-1000
-node driver.mjs run missions/<name> --dry-run   # show prompts, no pi
-node driver.mjs supervise                        # keep missions running (see below)
+node plainloop.mjs run missions/count-to-1000 --max 5 --verbose
+node plainloop.mjs status missions/count-to-1000
+node plainloop.mjs run missions/<name> --dry-run   # show prompts, no pi
+node plainloop.mjs supervise                        # keep missions running (see below)
 ```
 
 Flags:
@@ -199,24 +200,30 @@ Flags:
 └── driver.err.log driver stderr (crash diagnostics) when started via the extension
 ```
 
-### driver.json
+### driver.json (optional)
+
+A mission is markdown-first: `MISSION.md` states the goal, constraints and
+**exit criteria**, and the parent judges each outcome and replies `STOP`
+when the exit criteria are met. That works with **no `driver.json` at all** —
+every key below is optional and has a sensible default. Add `driver.json`
+only when you want the driver to enforce things *deterministically* (a shell
+`verify`/`exit` gate instead of the parent's judgment), schedule work, or
+tune timeouts and retries.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `taskPrompt` | see driver | Prompt for the parent to write `TASK.md`. Parent replies `READY` or `STOP <reason>`. Template vars: `{{dir}} {{n}} {{count}} {{next}}` |
 | `workerPrompt` | see driver | Prompt for the worker session. Same template vars |
 | `verify` | `null` | Shell command (run in mission dir) that must succeed after each task. Template vars allowed. `null` = no deterministic gate (the parent judges the outcome when writing the next task) |
-| `exit` | `null` | Shell command (run in mission dir); success = mission done, loop stops |
+| `exit` | `null` | Shell command (run in mission dir); success = mission done, loop stops. `null` = the parent decides (it replies `STOP` when the MISSION.md exit criteria are met) |
 | `wait` | `null` | Execution gate per iteration: `{"at":"2026-03-01T09:00:00+01:00"}` or `{"command":"test -f done.flag","intervalMs":30000,"timeoutMs":0}` (`timeoutMs` 0 = wait forever). Lower precedence than `Execute at/when` headers in INBOX.md entries or TASK.md |
 | `countPattern` | `null` | Regex with one capture group, matched in STATE.md to derive `{{count}}` |
 | `sessionCwd` | git root | cwd for the spawned pi sessions (pi keys sessions by cwd — defaulting to the repo root keeps them visible under the project in pi-web). Mission dir if no git root |
-| `compactEvery` | `5` | Compact the parent session after every N completed tasks |
-| `compactInstructions` | see driver | Focus instructions for the parent compaction |
 | `parentTimeoutSec` | `180` | Parent run timeout (writing `TASK.md`) before the driver gives up |
 | `workerTimeoutSec` | `240` | Worker run timeout before the driver steers it |
 | `steerGraceSec` | `60` | Grace period after steering before aborting |
 | `maxRetries` | `1` | Worker retries per task (each retry gets a parent-written corrective TASK.md) |
-| `parentRetries` | `1` | Retries when the parent settles without writing `TASK.md` and without replying `STOP` (e.g. a thinking-only turn). The driver re-prompts the **same** long-lived parent session with a corrective nudge; an explicit `STOP` reply is never retried. `0` = hard-stop on the first such settle |
+| `parentRetries` | `1` | Retries when the parent settles without writing `TASK.md` and without replying `STOP` (e.g. a thinking-only turn). The driver re-prompts the **same** parent session with a corrective nudge; an explicit `STOP` reply is never retried. `0` = hard-stop on the first such settle |
 | `transientRetryMaxSec` | `14400` | Per-run time budget for **transient** failures (LLM unreachable, session died, timeouts): the driver backs off and retries the same task instead of stopping. `0` = hard-stop (legacy behavior) |
 | `transientBackoffSec` | `60` | Initial backoff delay between transient retries (doubles each consecutive failure) |
 | `transientBackoffCapSec` | `900` | Cap for the transient backoff delay |
@@ -252,7 +259,7 @@ and retries the **same task** with a fresh worker, bounded by the per-run
 respawned (the loop is file-based, so a fresh parent reads MISSION/STATE/
 history). A new INBOX.md entry interrupts any backoff wait and is routed
 through the parent as usual. Events: `transient_retry`,
-`transient_budget_exhausted`, `parent_respawn`, `backoff_interrupted`.
+`transient_budget_exhausted`, `backoff_interrupted`.
 
 When the budget is exhausted the run exits non-zero — which is exactly what
 `supervise` (below) turns into a backoff + relaunch. While a backoff wait is
@@ -291,8 +298,8 @@ Per mission, every poll:
 - otherwise → launched as `plainloop run <mission> --verbose`, logging to
   the mission's `driver.out.log` / `driver.err.log` as before.
 
-Exit 0 (mission completed) marks it done; exit 1 (failure) schedules a
-relaunch. The supervisor is single-instance (pidfile next to the config,
+Exit 0 (mission completed — exit criteria met, or the parent replied `STOP`
+with a done verdict) marks it done; exit 1 (failure) schedules a relaunch. The supervisor is single-instance (pidfile next to the config,
 stale pidfiles from crashes/reboots are cleared), and `run` itself refuses
 to start a second instance for the same mission.
 
@@ -306,7 +313,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/node /path/to/plainloop/driver.mjs supervise
+ExecStart=/usr/bin/node /path/to/plainloop/plainloop.mjs supervise
 Restart=always
 RestartSec=30
 
@@ -325,7 +332,7 @@ loginctl enable-linger $USER   # start at boot without a login session
 - The driver splits stdout on `\n` only (LF framing per the RPC protocol);
   it never uses generic line readers.
 - `PI_BIN` env var overrides the `pi` binary (default: `pi` on PATH).
-- Parent/worker session names are `plainloop-parent-<mission>` /
+- Parent/worker session names are `plainloop-parent-NNNN-<mission>` /
   `plainloop-task-NNNN-<mission>` so they are easy to find in pi-web (legacy
   `plainloop-review-NNNN-<mission>` sessions from older versions are still
   listed by `list`).

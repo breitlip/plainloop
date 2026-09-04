@@ -26,7 +26,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const DRIVER = path.resolve(here, "..", "driver.mjs");
+const DRIVER = path.resolve(here, "..", "plainloop.mjs");
 const NODE = process.execPath;
 
 export default function plainloop(pi: ExtensionAPI) {

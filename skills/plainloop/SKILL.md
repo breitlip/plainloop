@@ -104,11 +104,13 @@ For each iteration:
 
 ## Rules that prevent failure modes
 
-- **The parent is stateless.** The parent session may be compacted or
-  restarted at any time. Everything needed to resume the loop must be
-  derivable from the files: the mission state from STATE.md, the iteration
-  count from `history/`, the in-flight work from TASK.md + CURRENT.md.
-  If you cannot resume from the files alone, write it to a file.
+- **The parent is stateless.** The parent is a fresh session per task (the
+  reference driver spawns one per task, like the worker), so nothing
+  accumulates and there is nothing to compact or carry over. Everything
+  needed to resume the loop must be derivable from the files: the mission
+  state from STATE.md, the iteration count from `history/`, the in-flight
+  work from TASK.md + CURRENT.md. If you cannot resume from the files alone,
+  write it to a file.
 - **One objective per iteration.** Small enough to finish in one session.
 - **Sessions never edit MISSION.md.** Only the parent changes direction.
 - **No per-iteration log in STATE.md.** Completed tasks are archived in
@@ -141,9 +143,10 @@ For each iteration:
 A driver script (no LLM context) supervises the loop and steers two kinds of
 pi sessions over RPC:
 
-- **parent** — one long-lived `pi --mode rpc` session. Writes each TASK.md,
-  diagnoses failures, and is **compacted on demand** by the driver
-  (`{"type": "compact", "customInstructions": "..."}`) every N iterations.
+- **parent** — one fresh `pi --mode rpc` session per task (stateless, like
+  the worker). Writes that task's TASK.md and diagnoses failures. Because it
+  is re-spawned each task, nothing accumulates and there is nothing to
+  compact.
 - **worker** — one `pi --mode rpc` session per task. Executes TASK.md. On
   timeout the driver sends `steer` ("stop, finish the minimal state update"),
   waits a grace period, then `abort`s and retries with a parent-written
@@ -168,39 +171,40 @@ text of a run is readable from `agent_end.messages` — use it for
 `READY`/`STOP` style decisions.
 
 The driver keeps the mission contract (MISSION/STATE/TASK/CURRENT/history)
-and adds a `driver.json` with the machine-checkable parts: `verify` and
-`exit` shell commands, `countPattern`, `compactEvery`, worker timeouts,
-retry policy (worker `maxRetries`, parent `parentRetries`). The reference
-implementation ships with this package as
-`driver.mjs` (see the package README).
+and adds an **optional** `driver.json` with the machine-checkable parts:
+`verify` and `exit` shell commands, `countPattern`, worker timeouts, retry
+policy (worker `maxRetries`, parent `parentRetries`). A mission with no
+`driver.json` works — the parent judges each outcome and replies `STOP` when
+the MISSION.md exit criteria are met. The reference implementation ships with
+this package as `plainloop.mjs` (see the package README).
 
-Running the driver: it is a plain Node script, no dependencies. `driver.mjs`
+Running the driver: it is a plain Node script, no dependencies. `plainloop.mjs`
 lives at the package root, next to `skills/`. Typical install locations:
 
 ```text
-git install:  ~/.pi/agent/git/github.com/<user>/plainloop/driver.mjs
-npm install:  ~/.pi/agent/npm/node_modules/plainloop/driver.mjs
+git install:  ~/.pi/agent/git/github.com/<user>/plainloop/plainloop.mjs
+npm install:  ~/.pi/agent/npm/node_modules/plainloop/plainloop.mjs
 ```
 
 ```bash
-node ~/.pi/agent/git/github.com/<user>/plainloop/driver.mjs run <mission-dir> --max 5 --verbose
+node ~/.pi/agent/git/github.com/<user>/plainloop/plainloop.mjs run <mission-dir> --max 5 --verbose
 node <driver> status <mission-dir>
 ```
 
 If a `plainloop` bin is on PATH (some installs link it), `plainloop run …`
-works directly. When in doubt: `find ~/.pi/agent -name driver.mjs -path "*plainloop*"`.
+works directly. When in doubt: `find ~/.pi/agent -name plainloop.mjs -path "*plainloop*"`.
 
 
 Reference implementation flow per task:
 
-1. parent: write TASK.md (replies `READY` or `STOP <reason>`; if it settles
-   with neither, the driver re-prompts the same parent up to `parentRetries`
-   times — a `STOP` reply is final and never retried)
+1. parent (fresh session): write TASK.md (replies `READY` or `STOP <reason>`;
+   if it settles with neither, the driver re-prompts the same session up to
+   `parentRetries` times — a `STOP` reply is final and never retried)
 2. worker: execute TASK.md (steer → abort → retry on timeout)
-3. driver: run `verify` command; on failure → corrective retry
+3. driver: run `verify` command (if configured); on failure → corrective
+   parent writes a smaller TASK.md and the worker retries
 4. driver: archive TASK.md → `history/TASK-NNNN.md`
-5. every N tasks: driver compacts the parent
-6. `exit` command succeeds, or parent says STOP → done
+5. `exit` command succeeds (if configured), or parent says STOP → done
 
 ## Inbox, scheduled execution, event log
 
@@ -258,6 +262,10 @@ exact charter slots, handoff prompt format, and smells to watch for — follow
 it; do not invent sizing or task-selection policies.
 
 ## Scaffolding a new mission
+
+A minimal working example ships with the package at
+`missions/count-to-1000/` (relative to the package root) — copy it and
+change the goal. The steps:
 
 1. Create `missions/<name>/` with the four files plus an empty `history/`.
 2. MISSION.md: goal, constraints, exit criteria, loop protocol (from above).

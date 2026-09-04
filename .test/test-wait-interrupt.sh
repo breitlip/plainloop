@@ -13,7 +13,7 @@ cd "$T"
 
 echo "=== TEST 1: inbox interrupts a 15s wait ==="
 START=$(date +%s)
-PI_BIN="$FAKEPI" FAKE_TASK_HEADER=1 FAKE_WAIT_MS=15000 node "$REPO/driver.mjs" run "$T/mission" --verbose &
+PI_BIN="$FAKEPI" FAKE_TASK_HEADER=1 FAKE_WAIT_MS=15000 node "$REPO/plainloop.mjs" run "$T/mission" --verbose &
 DPID=$!
 sleep 4
 cat > "$T/mission/INBOX.md" <<'EOF'
@@ -33,7 +33,7 @@ echo "=== TEST 2: wait elapses with no inbox ==="
 mkdir -p "$T/mission2"
 echo "# test mission 2" > "$T/mission2/MISSION.md"
 START=$(date +%s)
-PI_BIN="$FAKEPI" FAKE_TASK_HEADER=1 FAKE_WAIT_MS=5000 node "$REPO/driver.mjs" run "$T/mission2" --verbose &
+PI_BIN="$FAKEPI" FAKE_TASK_HEADER=1 FAKE_WAIT_MS=5000 node "$REPO/plainloop.mjs" run "$T/mission2" --verbose &
 DPID=$!
 wait $DPID
 CODE=$?
