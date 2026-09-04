@@ -129,20 +129,28 @@ const DEFAULTS = {
   transientRetryMaxSec: 14400, // total backoff budget per run (default 4h)
   transientBackoffSec: 60, // initial backoff delay
   transientBackoffCapSec: 900, // backoff delay cap
-  review: true,
-  reviewTimeoutSec: 120,
-  reviewPrompt:
-    "You are the independent read-only reviewer for task {{n}} of the mission " +
-    "in {{dir}}. Read MISSION.md, STATE.md, TASK.md, CURRENT.md, and the most " +
-    "recent files in history/. Judge whether the worker actually completed the " +
-    "TASK.md objective and its required STATE.md updates, without scope drift. " +
-    "You cannot modify files. Reply exactly: APPROVE, or REJECT <reason>.",
+};
+
+/** Keys removed in a release — warn explicitly, ignore the value. */
+const REMOVED_KEYS = {
+  review: "the reviewer session was removed in v0.5.0 — the parent judges each outcome",
+  reviewTimeoutSec: "the reviewer session was removed in v0.5.0",
+  reviewPrompt: "the reviewer session was removed in v0.5.0",
 };
 
 function loadDriverConfig(missionDir) {
   const file = path.join(missionDir, "driver.json");
   let raw = {};
   if (existsSync(file)) raw = JSON.parse(readFileSync(file, "utf8"));
+  // Unknown keys never break a run — they are ignored, with a warning on
+  // stderr. `_`-prefixed keys are comments (silently ignored).
+  for (const key of Object.keys(raw)) {
+    if (key.startsWith("_")) continue;
+    if (REMOVED_KEYS[key])
+      console.error(`driver.json: "${key}" is no longer supported (${REMOVED_KEYS[key]}) — ignored`);
+    else if (!(key in DEFAULTS))
+      console.error(`driver.json: unknown key "${key}" — ignored`);
+  }
   return { ...DEFAULTS, ...raw };
 }
 
@@ -162,18 +170,15 @@ export function backoffDelay(consecutive, baseSec, capSec) {
 
 /**
  * Classify a task/parent failure.
- *   semantic  — the work settled but was judged wrong (verify failed, reviewer
- *               REJECT): a corrective parent + a new attempt is the remedy.
+ *   semantic  — the work settled but was judged wrong (verify failed):
+ *               a corrective parent + a new attempt is the remedy.
  *   transient — the session could not reach the model (timeout, steer failure,
  *               process death): retrying the same task after a backoff is the
  *               remedy.
  * @returns {boolean} true when the failure is transient.
  */
 export function isTransientFailure(failure) {
-  const f = String(failure ?? "");
-  if (/verify command failed/i.test(f)) return false;
-  if (/^reviewer rejected:/i.test(f)) return false;
-  return true;
+  return !/verify command failed/i.test(String(failure ?? ""));
 }
 
 const STOP_RE = /^\s*STOP\b/i;
@@ -650,7 +655,7 @@ async function workerPromptWatchingInbox(worker, missionDir, cfg, message, timeo
 // ---------------------------------------------------------------------------
 
 class RpcSession {
-  constructor({ name, cwd, label, verbose, excludeTools }) {
+  constructor({ name, cwd, label, verbose }) {
     this.name = name;
     this.cwd = cwd;
     this.label = label;
@@ -662,8 +667,6 @@ class RpcSession {
     this.alive = false;
 
     const args = ["--mode", "rpc", "--name", name];
-    if (excludeTools?.length)
-      args.push("--exclude-tools", excludeTools.join(","));
     this.proc = spawn(
       PI_BIN,
       args,
@@ -1042,7 +1045,7 @@ async function cmdRun(missionDir, opts) {
   }
 
   // Transient-failure budget (per run): LLM-outage retries back off against
-  // this total; semantic failures (verify/review) keep the maxRetries path.
+  // this total; semantic failures (verify) keep the maxRetries path.
   const transientBudgetSec = Math.max(0, Math.floor(Number(cfg.transientRetryMaxSec) || 0));
   let consecutiveTransient = 0;
   let transientWaitedSec = 0;
@@ -1221,7 +1224,7 @@ async function cmdRun(missionDir, opts) {
         }
       }
 
-      // --- attempt loop: worker → verify → review ---------------------------
+      // --- attempt loop: worker → verify ------------------------------------
       const workerTimeoutMs = cfg.workerTimeoutSec * 1000;
       let taskOk = false;
       let failure = "";
@@ -1299,46 +1302,6 @@ async function cmdRun(missionDir, opts) {
             logLine(missionDir, `task ${n}: verify FAILED (attempt ${attempt + 1})`, verbose);
             event(missionDir, "verify_fail", { task: n, attempt: attempt + 1 });
             failure = "verify command failed";
-          }
-        }
-
-        // -- review (independent, read-only) ---------------------------------
-        if (workerSettled && !failure && cfg.review) {
-          const reviewer = new RpcSession({
-            name: `plainloop-review-${String(n).padStart(4, "0")}-${missionName}`,
-            cwd: sessionCwd,
-            label: `review-${n}${attempt ? `-${attempt}` : ""}`,
-            verbose,
-            excludeTools: ["bash", "edit", "write"],
-          });
-          let verdict = "";
-          writeState(missionDir, "review", { task: n, attempt: attempt + 1 });
-          try {
-            await reviewer.waitForReady();
-            verdict = await reviewer.prompt(
-              render(cfg.reviewPrompt, v),
-              cfg.reviewTimeoutSec * 1000,
-            );
-          } catch (e) {
-            logLine(
-              missionDir,
-              `task ${n}: reviewer unavailable (${e.message}) — verify already passed, continuing`,
-              verbose,
-            );
-          } finally {
-            reviewer.kill();
-          }
-          if (/^\s*REJECT\b/i.test(verdict)) {
-            logLine(
-              missionDir,
-              `task ${n}: reviewer REJECTED (attempt ${attempt + 1}): ${verdict.trim().slice(0, 200)}`,
-              verbose,
-            );
-            event(missionDir, "review_reject", { task: n, attempt: attempt + 1, reason: verdict.trim().slice(0, 200) });
-            failure = `reviewer rejected: ${verdict.trim().slice(0, 200)}`;
-          } else if (verdict) {
-            logLine(missionDir, `task ${n}: reviewer APPROVED`, verbose);
-            event(missionDir, "review_approve", { task: n, attempt: attempt + 1 });
           }
         }
 

@@ -24,7 +24,6 @@ test("isTransientFailure: infrastructure failures are transient", () => {
 
 test("isTransientFailure: judged-wrong work is semantic", () => {
   assert.equal(isTransientFailure("verify command failed"), false);
-  assert.equal(isTransientFailure("reviewer rejected: scope drift"), false);
 });
 
 test("isTransientFailure: empty/unknown defaults to transient (retry is safe)", () => {

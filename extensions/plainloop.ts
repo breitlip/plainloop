@@ -320,7 +320,7 @@ export default function plainloop(pi: ExtensionAPI) {
       "background driver run (optionally capped with max iterations) and returns immediately; " +
       "'stop' terminates a running mission; 'list' lists the missions under ./missions/ with " +
       "their status ([running] or [idle]) and relative paths when no mission is given (numbered " +
-      "1..n), or the mission's pi sessions (parent, task-NNNN, review-NNNN) when a mission is given so " +
+      "1..n), or the mission's pi sessions (parent, task-NNNN, legacy review-NNNN) when a mission is given so " +
       "they can be opened in pi-web; 'version' reports the installed extension version. " +
       "Omit mission to auto-detect the single mission under ./missions/ (for run/stop; " +
       "status requires a mission). Mission can be a name, a path, or a number 1..n from 'list'.",

@@ -1,6 +1,6 @@
 ---
 name: plainloop
-description: "Run long-running goals as a chain of small, self-contained sessions coordinated through shared markdown files (MISSION.md, STATE.md, TASK.md, CURRENT.md) and steered over pi's RPC protocol. A stateless driver script writes per-iteration tasks, spawns worker sessions, verifies results, runs an independent read-only reviewer, and archives. USE FOR: endless loops, iterative missions, relay chains, autonomous multi-session work, decomposing a big goal into per-session tasks, parent-child session handoff via files, long-running experiments, plainloop. DO NOT USE FOR: single-shot tasks that fit in one session, tasks with no persistence requirement."
+description: "Run long-running goals as a chain of small, self-contained sessions coordinated through shared markdown files (MISSION.md, STATE.md, TASK.md, CURRENT.md) and steered over pi's RPC protocol. A stateless driver script writes per-iteration tasks, spawns worker sessions, verifies results, and archives. USE FOR: endless loops, iterative missions, relay chains, autonomous multi-session work, decomposing a big goal into per-session tasks, parent-child session handoff via files, long-running experiments, plainloop. DO NOT USE FOR: single-shot tasks that fit in one session, tasks with no persistence requirement."
 ---
 
 # Plainloop
@@ -198,11 +198,9 @@ Reference implementation flow per task:
    times — a `STOP` reply is final and never retried)
 2. worker: execute TASK.md (steer → abort → retry on timeout)
 3. driver: run `verify` command; on failure → corrective retry
-4. reviewer: independent read-only session replies `APPROVE` or
-   `REJECT <reason>`; on reject → corrective retry
-5. driver: archive TASK.md → `history/TASK-NNNN.md`
-6. every N tasks: driver compacts the parent
-7. `exit` command succeeds, or parent says STOP → done
+4. driver: archive TASK.md → `history/TASK-NNNN.md`
+5. every N tasks: driver compacts the parent
+6. `exit` command succeeds, or parent says STOP → done
 
 ## Inbox, scheduled execution, event log
 
@@ -222,7 +220,7 @@ Reference implementation flow per task:
 - **Hot path (opt-in, `steerOnInbox`)** — new inbox entries while the worker
   runs steer the live worker session; `priority: stop` in an entry aborts it.
 - **events.jsonl** — append-only `{ts, event, detail}` log of every driver
-  action (task start, worker settle/timeout, verify, review, archive, inbox
+  action (task start, worker settle/timeout, verify, archive, inbox
   drain, wait begin/end/interrupt). `status` renders the last events and the
   current
   phase: `run — worker (task 3)` or `wait until … (remaining hh:mm:ss)`.
