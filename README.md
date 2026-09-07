@@ -191,6 +191,9 @@ Flags:
   its own exit criteria)
 - `--dry-run` — print the rendered prompts and checks, spawn nothing
 - `--verbose` — echo the driver log to stdout
+- `--model provider/id` — pin the model for both parent and worker sessions
+  (pi's `--model` semantics: `provider/id`, bare id, optional `:<thinking>`
+  suffix). Overrides `driver.json` `model`; omitted → pi's startup default
 
 ## Mission directory contract
 
@@ -226,6 +229,7 @@ tune timeouts and retries.
 | `exit` | `null` | Shell command (run in mission dir); success = mission done, loop stops. `null` = the parent decides (it replies `STOP` when the MISSION.md exit criteria are met) |
 | `wait` | `null` | Execution gate per iteration: `{"at":"2026-03-01T09:00:00+01:00"}` or `{"command":"test -f done.flag","intervalMs":30000,"timeoutMs":0}` (`timeoutMs` 0 = wait forever). Lower precedence than `Execute at/when` headers in INBOX.md entries or TASK.md |
 | `countPattern` | `null` | Regex with one capture group, matched in STATE.md to derive `{{count}}` |
+| `model` | `null` | Model pin for **both** parent and worker sessions, passed verbatim to pi's `--model` flag (`provider/id`, bare id, optional `:<thinking>` suffix, e.g. `sonnet:high`). Useful for unattended runs — a known-good model per mission. `null`/omitted = pi's startup default. Overridden by the `--model` CLI flag |
 | `sessionCwd` | git root | cwd for the spawned pi sessions (pi keys sessions by cwd — defaulting to the repo root keeps them visible under the project in pi-web). Mission dir if no git root |
 | `parentTimeoutSec` | `180` | Parent run timeout (writing `TASK.md`) before the driver gives up |
 | `workerTimeoutSec` | `240` | Worker run timeout before the driver steers it |

@@ -173,7 +173,10 @@ text of a run is readable from `agent_end.messages` — use it for
 The driver keeps the mission contract (MISSION/STATE/TASK/CURRENT/history)
 and adds an **optional** `driver.json` with the machine-checkable parts:
 `verify` and `exit` shell commands, `countPattern`, worker timeouts, retry
-policy (worker `maxRetries`, parent `parentRetries`). A mission with no
+policy (worker `maxRetries`, parent `parentRetries`), and an optional `model`
+key pinning the model for both parent and worker sessions (passed verbatim
+to pi's `--model` flag; the `--model` CLI flag overrides it). A mission with
+no
 `driver.json` works — the parent judges each outcome and replies `STOP` when
 the MISSION.md exit criteria are met. The reference implementation ships with
 this package as `plainloop.mjs` (see the package README).

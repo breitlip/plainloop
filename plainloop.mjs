@@ -20,7 +20,7 @@
  *   driver.json  machine-readable driver contract (see README.md)
  *
  * Usage:
- *   node plainloop.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]
+ *   node plainloop.mjs run <mission-dir> [--max N] [--dry-run] [--verbose] [--model provider/id]
  *   node plainloop.mjs status <mission-dir>
  */
 
@@ -142,6 +142,7 @@ const DEFAULTS = {
   steerOnInbox: false, // hot path: steer the running worker on new INBOX.md entries
   inboxPollMs: 5000, // inbox poll interval while the worker runs (steerOnInbox)
   countPattern: null, // regex with one capture group, matched in STATE.md
+  model: null, // pi --model value for parent + worker (e.g. "anthropic/claude-sonnet-4-5", bare id, or "id:thinking"); null = pi startup default
   parentTimeoutSec: 180,
   workerTimeoutSec: 240,
   steerGraceSec: 60,
@@ -674,8 +675,25 @@ async function workerPromptWatchingInbox(worker, missionDir, cfg, message, timeo
 // pi RPC client (JSONL over stdin/stdout, LF-framed)
 // ---------------------------------------------------------------------------
 
+/**
+ * Spawn args for a pi session (pure — exported for node --test).
+ * `model` is passed verbatim to pi's `--model` flag (provider/id, bare id,
+ * optional `:<thinking>` suffix); omitted → pi's startup default model,
+ * and the args are byte-identical to the pre-model-pin behavior.
+ */
+export function piSessionArgs(name, model) {
+  return [
+    ...PI_EXTRA_ARGS,
+    "--mode",
+    "rpc",
+    "--name",
+    name,
+    ...(model ? ["--model", model] : []),
+  ];
+}
+
 class RpcSession {
-  constructor({ name, cwd, label, verbose }) {
+  constructor({ name, cwd, label, verbose, model }) {
     this.name = name;
     this.cwd = cwd;
     this.label = label;
@@ -686,13 +704,7 @@ class RpcSession {
     this.eventWaiters = [];
     this.alive = false;
 
-    const args = [
-      ...PI_EXTRA_ARGS,
-      "--mode",
-      "rpc",
-      "--name",
-      name,
-    ];
+    const args = piSessionArgs(name, model);
     this.proc = spawn(
       PI_BIN,
       args,
@@ -980,6 +992,11 @@ async function cmdRun(missionDir, opts) {
     cfg.sessionCwd ?? (gitRoot(missionDir) || missionDir);
   if (sessionCwd !== missionDir)
     event(missionDir, "session_cwd", { note: `session cwd: ${sessionCwd}` }, `session cwd: ${sessionCwd}`, verbose);
+  // Model pin: CLI --model > driver.json `model` > pi's startup default.
+  // Applies to both parent and worker sessions.
+  const model = opts.model || cfg.model || null;
+  if (model)
+    event(missionDir, "model", { model }, `model: ${model}`, verbose);
   const vars = () => {
     const done = historyTasks(missionDir);
     const state = existsSync(path.join(missionDir, "STATE.md"))
@@ -1010,6 +1027,7 @@ async function cmdRun(missionDir, opts) {
     console.log(`  inbox:        ${existsSync(path.join(missionDir, "INBOX.md")) ? "present" : "(none)"}`);
     console.log(`  wait:         ${cfg.wait ? JSON.stringify(cfg.wait) : "(none)"}`);
     console.log(`  steerOnInbox: ${cfg.steerOnInbox}`);
+    console.log(`  model:        ${model ?? "(pi startup default)"}`);
     return 0;
   }
 
@@ -1067,6 +1085,7 @@ async function cmdRun(missionDir, opts) {
       cwd: sessionCwd,
       label: `parent-${task}`,
       verbose,
+      model,
     });
     try {
       await p.waitForReady();
@@ -1232,6 +1251,7 @@ async function cmdRun(missionDir, opts) {
           cwd: sessionCwd,
           label: `worker-${n}${attempt ? `-${attempt}` : ""}`,
           verbose,
+          model,
         });
         const wStart = Date.now();
         let workerSettled = false;
@@ -1554,6 +1574,7 @@ for (let i = 0; i < rest.length; i++) {
         "--max",
         "--timeout",
         "--config",
+        "--model",
       ].includes(rest[i]) &&
       i + 1 < rest.length &&
       !rest[i + 1].startsWith("--")
@@ -1589,6 +1610,7 @@ if (isMain) {
           : undefined,
         dryRun: flags.includes("--dry-run"),
         verbose: flags.includes("--verbose"),
+        model: flagValue("--model", undefined) || undefined,
       });
       process.exitCode = code;
     } else if (cmd === "supervise") {
@@ -1597,7 +1619,7 @@ if (isMain) {
     } else {
       console.log(
         "usage:\n" +
-          "  node plainloop.mjs run <mission-dir> [--max N] [--dry-run] [--verbose]   (alias: start)\n" +
+          "  node plainloop.mjs run <mission-dir> [--max N] [--dry-run] [--verbose] [--model provider/id]   (alias: start)\n" +
           "  node plainloop.mjs supervise [--config PATH]   # keep missions running across crashes/reboots\n" +
           "  node plainloop.mjs status <mission-dir>\n" +
           "  node plainloop.mjs list <mission-dir>",
